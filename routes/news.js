@@ -8,6 +8,7 @@ const newsController = require('../controllers/newsController');
 const { requireAuth, requirePermission, requireOwnership, optionalAuth } = require('../middleware/auth');
 const { apiRateLimit } = require('../middleware/security');
 const { checkTenantLimits } = require('../middleware/tenant');
+const { uploadSingleImage } = require('../middleware/upload');
 
 // Validation rules
 const createNewsValidation = [
@@ -38,6 +39,10 @@ const createNewsValidation = [
     .optional()
     .isIn(['public', 'private', 'password'])
     .withMessage('Invalid visibility'),
+  body('featured_image_alt')
+    .optional()
+    .isLength({ max: 255 })
+    .withMessage('Image alt text must be less than 255 characters'),
   body('meta_title')
     .optional()
     .isLength({ max: 255 })
@@ -49,7 +54,19 @@ const createNewsValidation = [
   body('scheduled_at')
     .optional()
     .isISO8601()
-    .withMessage('Valid date is required for scheduled publishing')
+    .withMessage('Valid date is required for scheduled publishing'),
+  body('is_featured')
+    .optional()
+    .isBoolean()
+    .withMessage('Is featured must be boolean'),
+  body('is_breaking')
+    .optional()
+    .isBoolean()
+    .withMessage('Is breaking must be boolean'),
+  body('allow_comments')
+    .optional()
+    .isBoolean()
+    .withMessage('Allow comments must be boolean')
 ];
 
 const updateNewsValidation = [
@@ -83,6 +100,10 @@ const updateNewsValidation = [
     .optional()
     .isIn(['public', 'private', 'password'])
     .withMessage('Invalid visibility'),
+  body('remove_featured_image')
+    .optional()
+    .isIn(['true', 'false'])
+    .withMessage('Remove featured image must be true or false'),
   body('scheduled_at')
     .optional()
     .isISO8601()
@@ -157,6 +178,7 @@ router.get('/published',
  */
 router.get('/featured',
   apiRateLimit,
+  query('limit').optional().isInt({ min: 1, max: 20 }),
   newsController.getFeaturedNews
 );
 
@@ -167,6 +189,7 @@ router.get('/featured',
  */
 router.get('/breaking',
   apiRateLimit,
+  query('limit').optional().isInt({ min: 1, max: 10 }),
   newsController.getBreakingNews
 );
 
@@ -230,25 +253,29 @@ router.get('/:id',
 
 /**
  * @route   POST /api/news
- * @desc    Create new news article
+ * @desc    Create new news article with optional image upload
  * @access  Private (Contributor+)
+ * @upload  Single image file (optional)
  */
 router.post('/',
   requireAuth,
   requirePermission('news', 'create'),
   checkTenantLimits('articles'),
+  uploadSingleImage('articles'), // Handle image upload
   createNewsValidation,
   newsController.createNews
 );
 
 /**
  * @route   PUT /api/news/:id
- * @desc    Update news article
+ * @desc    Update news article with optional image upload
  * @access  Private (Owner, Editor+)
+ * @upload  Single image file (optional)
  */
 router.put('/:id',
   requireAuth,
   idValidation,
+  uploadSingleImage('articles'), // Handle image upload
   updateNewsValidation,
   newsController.updateNews
 );
@@ -316,13 +343,13 @@ router.post('/:id/like',
         });
       }
 
-      await article.incrementLikes();
+      await article.increment('likes_count');
 
       res.json({
         success: true,
         message: 'Article liked',
         data: {
-          likes_count: article.likes_count
+          likes_count: article.likes_count + 1
         }
       });
 
@@ -343,6 +370,7 @@ router.post('/:id/like',
 router.post('/:id/share',
   apiRateLimit,
   idValidation,
+  body('platform').optional().isIn(['facebook', 'twitter', 'linkedin', 'whatsapp', 'email', 'copy']),
   async (req, res) => {
     try {
       const article = await req.models.News.findByPk(req.params.id);
@@ -361,13 +389,14 @@ router.post('/:id/share',
         });
       }
 
-      await article.incrementShares();
+      await article.increment('shares_count');
 
       res.json({
         success: true,
         message: 'Share tracked',
         data: {
-          shares_count: article.shares_count
+          shares_count: article.shares_count + 1,
+          platform: req.body.platform || 'unknown'
         }
       });
 
@@ -375,6 +404,95 @@ router.post('/:id/share',
       res.status(500).json({
         success: false,
         message: 'Failed to track share'
+      });
+    }
+  }
+);
+
+/**
+ * @route   GET /api/news/:id/related
+ * @desc    Get related articles based on category and tags
+ * @access  Public
+ */
+router.get('/:id/related',
+  apiRateLimit,
+  idValidation,
+  query('limit').optional().isInt({ min: 1, max: 10 }),
+  async (req, res) => {
+    try {
+      const article = await req.models.News.findByPk(req.params.id, {
+        include: [
+          {
+            model: req.models.Tag,
+            as: 'tags',
+            attributes: ['id']
+          }
+        ]
+      });
+
+      if (!article) {
+        return res.status(404).json({
+          success: false,
+          message: 'Article not found'
+        });
+      }
+
+      const limit = parseInt(req.query.limit) || 5;
+      const tagIds = article.tags.map(tag => tag.id);
+
+      // Find related articles
+      const where = {
+        id: { [req.models.News.sequelize.Sequelize.Op.ne]: article.id },
+        status: 'published',
+        visibility: 'public'
+      };
+
+      // Priority: same category or matching tags
+      const relatedArticles = await req.models.News.findAll({
+        where: {
+          ...where,
+          [req.models.News.sequelize.Sequelize.Op.or]: [
+            { category_id: article.category_id },
+            tagIds.length > 0 ? {
+              '$tags.id$': { [req.models.News.sequelize.Sequelize.Op.in]: tagIds }
+            } : {}
+          ]
+        },
+        include: [
+          {
+            model: req.models.User,
+            as: 'author',
+            attributes: ['id', 'first_name', 'last_name']
+          },
+          {
+            model: req.models.Category,
+            as: 'category',
+            attributes: ['id', 'name', 'slug']
+          },
+          {
+            model: req.models.Tag,
+            as: 'tags',
+            attributes: ['id', 'name', 'slug'],
+            through: { attributes: [] }
+          }
+        ],
+        order: [['published_at', 'DESC']],
+        limit,
+        distinct: true
+      });
+
+      res.json({
+        success: true,
+        data: {
+          related_articles: relatedArticles,
+          count: relatedArticles.length
+        }
+      });
+
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: 'Failed to fetch related articles'
       });
     }
   }

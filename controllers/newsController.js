@@ -2,6 +2,8 @@
 const { validationResult } = require('express-validator');
 const { Op } = require('sequelize');
 const logger = require('../utils/logger');
+const cacheService = require('../config/redis');
+const uploadService = require('../services/uploadService');
 const { sanitizeHtmlContent } = require('../middleware/security');
 
 /**
@@ -22,32 +24,30 @@ const getAllNews = async (req, res) => {
       breaking
     } = req.query;
 
-    // Parse pagination
     const offset = (parseInt(page) - 1) * parseInt(limit);
-    const pageLimit = Math.min(parseInt(limit), 100); // Max 100 items per page
+    const pageLimit = Math.min(parseInt(limit), 100);
+
+    // Generate cache key
+    const cacheKey = `list:${JSON.stringify({
+      page, limit, status, category_id, author_id, search, 
+      sort, order, featured, breaking, user_role: req.currentUser.role
+    })}`;
+
+    // Try to get from cache
+    const cached = await cacheService.getCachedArticleList(req.tenantId, cacheKey);
+    if (cached) {
+      logger.debug('Serving articles from cache');
+      return res.json(cached);
+    }
 
     // Build where clause
     const where = {};
     
-    if (status) {
-      where.status = status;
-    }
-    
-    if (category_id) {
-      where.category_id = category_id;
-    }
-    
-    if (author_id) {
-      where.author_id = author_id;
-    }
-    
-    if (featured === 'true') {
-      where.is_featured = true;
-    }
-    
-    if (breaking === 'true') {
-      where.is_breaking = true;
-    }
+    if (status) where.status = status;
+    if (category_id) where.category_id = category_id;
+    if (author_id) where.author_id = author_id;
+    if (featured === 'true') where.is_featured = true;
+    if (breaking === 'true') where.is_breaking = true;
     
     if (search) {
       where[Op.or] = [
@@ -57,7 +57,7 @@ const getAllNews = async (req, res) => {
       ];
     }
 
-    // For non-admin users, only show their own articles or published ones
+    // Apply role-based filtering
     if (!['super_admin', 'admin'].includes(req.currentUser.role)) {
       if (req.currentUser.role === 'contributor') {
         where[Op.or] = [
@@ -72,7 +72,6 @@ const getAllNews = async (req, res) => {
       }
     }
 
-    // Get articles with associations
     const { count, rows: articles } = await req.models.News.findAndCountAll({
       where,
       include: [
@@ -99,25 +98,46 @@ const getAllNews = async (req, res) => {
       distinct: true
     });
 
-    // Calculate pagination info
     const totalPages = Math.ceil(count / pageLimit);
-    const hasNextPage = page < totalPages;
-    const hasPrevPage = page > 1;
-
-    res.json({
+    
+    // Process articles with image URLs
+    const processedArticles = articles.map(article => {
+      const articleData = article.toJSON();
+      
+      // Add image URLs if featured_image_data exists
+      if (articleData.featured_image_data) {
+        articleData.featured_image_urls = uploadService.getImageUrls(
+          req.tenantId,
+          'articles',
+          articleData.featured_image_data
+        );
+      }
+      
+      // Clean up internal data
+      delete articleData.featured_image_data;
+      
+      return articleData;
+    });
+    
+    const response = {
       success: true,
       data: {
-        articles,
+        articles: processedArticles,
         pagination: {
           current_page: parseInt(page),
           total_pages: totalPages,
           total_items: count,
           items_per_page: pageLimit,
-          has_next_page: hasNextPage,
-          has_prev_page: hasPrevPage
+          has_next_page: page < totalPages,
+          has_prev_page: page > 1
         }
       }
-    });
+    };
+
+    // Cache the response for 5 minutes
+    await cacheService.cacheArticleList(req.tenantId, cacheKey, response, 300);
+
+    res.json(response);
 
   } catch (error) {
     logger.error('Get all news error:', error);
@@ -135,9 +155,15 @@ const getNewsById = async (req, res) => {
   try {
     const identifier = req.params.id;
     
+    // Try to get from cache first
+    const cached = await cacheService.getCachedArticle(req.tenantId, identifier);
+    if (cached) {
+      logger.debug('Serving article from cache');
+      return res.json(cached);
+    }
+    
     // Check if identifier is UUID or slug
     const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(identifier);
-    
     const whereClause = isUUID ? { id: identifier } : { slug: identifier };
     
     const article = await req.models.News.findOne({
@@ -184,17 +210,38 @@ const getNewsById = async (req, res) => {
       });
     }
 
+    // Process article data
+    const articleData = article.toJSON();
+    
+    // Add image URLs if featured_image_data exists
+    if (articleData.featured_image_data) {
+      articleData.featured_image_urls = uploadService.getImageUrls(
+        req.tenantId,
+        'articles',
+        articleData.featured_image_data
+      );
+    }
+    
+    // Clean up internal data
+    delete articleData.featured_image_data;
+
     // Increment view count for published articles
     if (article.status === 'published' && article.visibility === 'public') {
-      await article.incrementViews();
+      await article.increment('views_count');
+      articleData.views_count += 1;
     }
 
-    res.json({
+    const response = {
       success: true,
       data: {
-        article
+        article: articleData
       }
-    });
+    };
+
+    // Cache the article for 30 minutes
+    await cacheService.cacheArticle(req.tenantId, identifier, response);
+
+    res.json(response);
 
   } catch (error) {
     logger.error('Get news by ID error:', error);
@@ -210,7 +257,6 @@ const getNewsById = async (req, res) => {
  */
 const createNews = async (req, res) => {
   try {
-    // Validate request
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return res.status(400).json({
@@ -228,7 +274,6 @@ const createNews = async (req, res) => {
       tags = [],
       status = 'draft',
       visibility = 'public',
-      featured_image,
       featured_image_alt,
       meta_title,
       meta_description,
@@ -250,10 +295,32 @@ const createNews = async (req, res) => {
       });
     }
 
-    // Check if user can publish
-    const finalStatus = (status === 'published' && !req.currentUser.canPublish()) 
-      ? 'review' 
-      : status;
+    // Check permissions for status
+    let finalStatus = status;
+    if (status === 'published' && !req.currentUser.canPublish()) {
+      finalStatus = 'review';
+    }
+
+    // Handle image upload
+    let featuredImageData = null;
+    if (req.file) {
+      try {
+        featuredImageData = await uploadService.processAndSaveImage(
+          req.file.buffer,
+          req.tenantId,
+          'articles',
+          true // Generate multiple sizes
+        );
+        logger.info(`Featured image processed for article: ${featuredImageData.id}`);
+      } catch (imageError) {
+        logger.error('Image upload error:', imageError);
+        return res.status(400).json({
+          success: false,
+          message: 'Failed to process uploaded image',
+          error: imageError.message
+        });
+      }
+    }
 
     // Sanitize content
     const sanitizedData = {
@@ -263,7 +330,8 @@ const createNews = async (req, res) => {
       category_id,
       status: finalStatus,
       visibility,
-      featured_image,
+      featured_image: featuredImageData?.id || null,
+      featured_image_data: featuredImageData || null,
       featured_image_alt: featured_image_alt ? sanitizeHtmlContent(featured_image_alt) : null,
       meta_title: meta_title ? sanitizeHtmlContent(meta_title) : null,
       meta_description: meta_description ? sanitizeHtmlContent(meta_description) : null,
@@ -276,7 +344,6 @@ const createNews = async (req, res) => {
       author_id: req.currentUser.id
     };
 
-    // Create article
     const article = await req.models.News.create(sanitizedData);
 
     // Handle tags
@@ -307,14 +374,26 @@ const createNews = async (req, res) => {
       ]
     });
 
+    // Invalidate cache
+    await cacheService.invalidateArticleCache(req.tenantId);
+
     logger.info(`Article created: ${article.title} by ${req.currentUser.email}`);
+
+    // Process response with image URLs
+    const responseData = createdArticle.toJSON();
+    if (featuredImageData) {
+      responseData.featured_image_urls = uploadService.getImageUrls(
+        req.tenantId,
+        'articles',
+        featuredImageData
+      );
+    }
+    delete responseData.featured_image_data;
 
     res.status(201).json({
       success: true,
       message: 'Article created successfully',
-      data: {
-        article: createdArticle
-      }
+      data: { article: responseData }
     });
 
   } catch (error) {
@@ -331,7 +410,6 @@ const createNews = async (req, res) => {
  */
 const updateNews = async (req, res) => {
   try {
-    // Validate request
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return res.status(400).json({
@@ -373,7 +451,6 @@ const updateNews = async (req, res) => {
       tags,
       status,
       visibility,
-      featured_image,
       featured_image_alt,
       meta_title,
       meta_description,
@@ -382,8 +459,43 @@ const updateNews = async (req, res) => {
       is_breaking,
       allow_comments,
       scheduled_at,
-      custom_fields
+      custom_fields,
+      remove_featured_image
     } = req.body;
+
+    // Handle image upload or removal
+    let featuredImageData = article.featured_image_data;
+    
+    if (remove_featured_image === 'true') {
+      // Remove existing image
+      if (article.featured_image) {
+        await uploadService.deleteImage(req.tenantId, article.featured_image, 'articles');
+      }
+      featuredImageData = null;
+    } else if (req.file) {
+      // Remove old image if exists
+      if (article.featured_image) {
+        await uploadService.deleteImage(req.tenantId, article.featured_image, 'articles');
+      }
+      
+      // Process new image
+      try {
+        featuredImageData = await uploadService.processAndSaveImage(
+          req.file.buffer,
+          req.tenantId,
+          'articles',
+          true
+        );
+        logger.info(`Featured image updated for article: ${articleId}`);
+      } catch (imageError) {
+        logger.error('Image update error:', imageError);
+        return res.status(400).json({
+          success: false,
+          message: 'Failed to process uploaded image',
+          error: imageError.message
+        });
+      }
+    }
 
     // Check if user can publish
     let finalStatus = status;
@@ -399,7 +511,6 @@ const updateNews = async (req, res) => {
     if (category_id !== undefined) updateData.category_id = category_id;
     if (status !== undefined) updateData.status = finalStatus;
     if (visibility !== undefined) updateData.visibility = visibility;
-    if (featured_image !== undefined) updateData.featured_image = featured_image;
     if (featured_image_alt !== undefined) updateData.featured_image_alt = featured_image_alt ? sanitizeHtmlContent(featured_image_alt) : null;
     if (meta_title !== undefined) updateData.meta_title = meta_title ? sanitizeHtmlContent(meta_title) : null;
     if (meta_description !== undefined) updateData.meta_description = meta_description ? sanitizeHtmlContent(meta_description) : null;
@@ -407,6 +518,10 @@ const updateNews = async (req, res) => {
     if (allow_comments !== undefined) updateData.allow_comments = allow_comments;
     if (scheduled_at !== undefined) updateData.scheduled_at = scheduled_at ? new Date(scheduled_at) : null;
     if (custom_fields !== undefined) updateData.custom_fields = custom_fields;
+
+    // Handle image data
+    updateData.featured_image = featuredImageData?.id || null;
+    updateData.featured_image_data = featuredImageData;
 
     // Only admins and editors can set featured/breaking
     if (['super_admin', 'admin', 'editor'].includes(req.currentUser.role)) {
@@ -451,14 +566,26 @@ const updateNews = async (req, res) => {
       ]
     });
 
+    // Invalidate cache
+    await cacheService.invalidateArticleCache(req.tenantId, articleId);
+
     logger.info(`Article updated: ${article.title} by ${req.currentUser.email}`);
+
+    // Process response with image URLs
+    const responseData = updatedArticle.toJSON();
+    if (featuredImageData) {
+      responseData.featured_image_urls = uploadService.getImageUrls(
+        req.tenantId,
+        'articles',
+        featuredImageData
+      );
+    }
+    delete responseData.featured_image_data;
 
     res.json({
       success: true,
       message: 'Article updated successfully',
-      data: {
-        article: updatedArticle
-      }
+      data: { article: responseData }
     });
 
   } catch (error) {
@@ -500,11 +627,19 @@ const deleteNews = async (req, res) => {
       });
     }
 
-    // Store article title for logging
     const articleTitle = article.title;
+    const featuredImage = article.featured_image;
 
     // Delete article (tags will be automatically removed due to cascade)
     await article.destroy();
+
+    // Delete associated images
+    if (featuredImage) {
+      await uploadService.deleteImage(req.tenantId, featuredImage, 'articles');
+    }
+
+    // Invalidate cache
+    await cacheService.invalidateArticleCache(req.tenantId, articleId);
 
     logger.info(`Article deleted: ${articleTitle} by ${req.currentUser.email}`);
 
@@ -606,6 +741,17 @@ const getPublishedNews = async (req, res) => {
     const offset = (parseInt(page) - 1) * parseInt(limit);
     const pageLimit = Math.min(parseInt(limit), 50);
 
+    // Generate cache key for public articles
+    const cacheKey = `public:${JSON.stringify({
+      page, limit, category_id, tag_id, search, sort, featured, breaking
+    })}`;
+
+    // Try to get from cache
+    const cached = await cacheService.getCachedArticleList(req.tenantId, cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
     // Build where clause for published articles
     const where = {
       status: 'published',
@@ -615,17 +761,9 @@ const getPublishedNews = async (req, res) => {
       }
     };
 
-    if (category_id) {
-      where.category_id = category_id;
-    }
-
-    if (featured === 'true') {
-      where.is_featured = true;
-    }
-
-    if (breaking === 'true') {
-      where.is_breaking = true;
-    }
+    if (category_id) where.category_id = category_id;
+    if (featured === 'true') where.is_featured = true;
+    if (breaking === 'true') where.is_breaking = true;
 
     if (search) {
       where[Op.or] = [
@@ -671,10 +809,26 @@ const getPublishedNews = async (req, res) => {
 
     const totalPages = Math.ceil(count / pageLimit);
 
-    res.json({
+    // Process articles with image URLs
+    const processedArticles = articles.map(article => {
+      const articleData = article.toJSON();
+      
+      if (articleData.featured_image_data) {
+        articleData.featured_image_urls = uploadService.getImageUrls(
+          req.tenantId,
+          'articles',
+          articleData.featured_image_data
+        );
+      }
+      
+      delete articleData.featured_image_data;
+      return articleData;
+    });
+
+    const response = {
       success: true,
       data: {
-        articles,
+        articles: processedArticles,
         pagination: {
           current_page: parseInt(page),
           total_pages: totalPages,
@@ -684,7 +838,12 @@ const getPublishedNews = async (req, res) => {
           has_prev_page: page > 1
         }
       }
-    });
+    };
+
+    // Cache for 5 minutes
+    await cacheService.cacheArticleList(req.tenantId, cacheKey, response, 300);
+
+    res.json(response);
 
   } catch (error) {
     logger.error('Get published news error:', error);

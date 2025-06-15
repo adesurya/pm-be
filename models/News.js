@@ -1,4 +1,4 @@
-// models/News.js
+// models/News.js - Enhanced with image support
 const { DataTypes } = require('sequelize');
 const slugify = require('slugify');
 
@@ -45,13 +45,27 @@ module.exports = (sequelize) => {
       type: DataTypes.TEXT('long'),
       allowNull: true
     },
+    // Enhanced image fields
     featured_image: {
       type: DataTypes.STRING(255),
-      allowNull: true
+      allowNull: true,
+      comment: 'Image ID reference'
+    },
+    featured_image_data: {
+      type: DataTypes.JSON,
+      allowNull: true,
+      comment: 'Complete image data with all sizes'
     },
     featured_image_alt: {
       type: DataTypes.STRING(255),
       allowNull: true
+    },
+    // Gallery support
+    gallery_images: {
+      type: DataTypes.JSON,
+      allowNull: true,
+      defaultValue: [],
+      comment: 'Array of image data objects'
     },
     status: {
       type: DataTypes.ENUM('draft', 'review', 'published', 'archived'),
@@ -157,6 +171,19 @@ module.exports = (sequelize) => {
       defaultValue: true,
       allowNull: false
     },
+    // SEO and performance fields
+    seo_score: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0,
+      allowNull: true,
+      comment: 'SEO score 0-100'
+    },
+    readability_score: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0,
+      allowNull: true,
+      comment: 'Readability score 0-100'
+    },
     created_at: {
       type: DataTypes.DATE,
       defaultValue: DataTypes.NOW,
@@ -197,6 +224,12 @@ module.exports = (sequelize) => {
       },
       {
         fields: ['created_at']
+      },
+      {
+        fields: ['views_count']
+      },
+      {
+        fields: ['likes_count']
       }
     ],
     hooks: {
@@ -214,6 +247,11 @@ module.exports = (sequelize) => {
         // Set published_at if status is published
         if (news.status === 'published' && !news.published_at) {
           news.published_at = new Date();
+        }
+
+        // Generate excerpt if not provided
+        if (!news.excerpt && news.content) {
+          news.excerpt = News.generateExcerpt(news.content);
         }
       },
       
@@ -237,6 +275,11 @@ module.exports = (sequelize) => {
         if (news.changed('status') && news.status !== 'published' && news.published_at) {
           news.published_at = null;
         }
+
+        // Update excerpt if content changed and no custom excerpt
+        if (news.changed('content') && !news.excerpt && news.content) {
+          news.excerpt = News.generateExcerpt(news.content);
+        }
         
         news.updated_at = new Date();
       }
@@ -257,18 +300,47 @@ module.exports = (sequelize) => {
   };
 
   News.prototype.incrementViews = async function() {
-    this.views_count += 1;
-    await this.save({ fields: ['views_count'] });
+    return await this.increment('views_count');
   };
 
   News.prototype.incrementLikes = async function() {
-    this.likes_count += 1;
-    await this.save({ fields: ['likes_count'] });
+    return await this.increment('likes_count');
   };
 
   News.prototype.incrementShares = async function() {
-    this.shares_count += 1;
-    await this.save({ fields: ['shares_count'] });
+    return await this.increment('shares_count');
+  };
+
+  // Enhanced image methods
+  News.prototype.getFeaturedImageUrl = function(size = 'medium', baseUrl = null) {
+    if (!this.featured_image_data || !this.featured_image_data.images) {
+      return null;
+    }
+    
+    const image = this.featured_image_data.images[size];
+    if (!image) return null;
+    
+    const domain = baseUrl || process.env.CDN_URL || process.env.BASE_URL || 'http://localhost:3000';
+    return `${domain}${image.path}`;
+  };
+
+  News.prototype.getAllImageUrls = function(baseUrl = null) {
+    if (!this.featured_image_data || !this.featured_image_data.images) {
+      return {};
+    }
+    
+    const domain = baseUrl || process.env.CDN_URL || process.env.BASE_URL || 'http://localhost:3000';
+    const urls = {};
+    
+    for (const [size, image] of Object.entries(this.featured_image_data.images)) {
+      urls[size] = `${domain}${image.path}`;
+    }
+    
+    return urls;
+  };
+
+  News.prototype.getMetaImage = function() {
+    return this.social_image || this.getFeaturedImageUrl('large');
   };
 
   // Class methods
@@ -302,6 +374,18 @@ module.exports = (sequelize) => {
     const wordsPerMinute = 200;
     const words = content.replace(/<[^>]*>/g, '').split(/\s+/).length;
     return Math.ceil(words / wordsPerMinute);
+  };
+
+  News.generateExcerpt = function(content, maxLength = 200) {
+    const cleanContent = content.replace(/<[^>]*>/g, '').trim();
+    if (cleanContent.length <= maxLength) {
+      return cleanContent;
+    }
+    
+    const truncated = cleanContent.substring(0, maxLength);
+    const lastSpace = truncated.lastIndexOf(' ');
+    
+    return lastSpace > 0 ? truncated.substring(0, lastSpace) + '...' : truncated + '...';
   };
 
   News.findPublished = async function(options = {}) {
@@ -425,5 +509,362 @@ module.exports = (sequelize) => {
     });
   };
 
+  // Analytics methods
+  News.getEngagementStats = async function(articleId = null) {
+    const whereClause = articleId ? { id: articleId } : { status: 'published' };
+    
+    const stats = await this.findOne({
+      where: whereClause,
+      attributes: [
+        [sequelize.fn('AVG', sequelize.col('views_count')), 'avg_views'],
+        [sequelize.fn('AVG', sequelize.col('likes_count')), 'avg_likes'],
+        [sequelize.fn('AVG', sequelize.col('shares_count')), 'avg_shares'],
+        [sequelize.fn('AVG', sequelize.col('comments_count')), 'avg_comments'],
+        [sequelize.fn('SUM', sequelize.col('views_count')), 'total_views'],
+        [sequelize.fn('SUM', sequelize.col('likes_count')), 'total_likes'],
+        [sequelize.fn('SUM', sequelize.col('shares_count')), 'total_shares'],
+        [sequelize.fn('COUNT', sequelize.col('id')), 'total_articles']
+      ],
+      raw: true
+    });
+    
+    return {
+      averages: {
+        views: parseFloat(stats.avg_views) || 0,
+        likes: parseFloat(stats.avg_likes) || 0,
+        shares: parseFloat(stats.avg_shares) || 0,
+        comments: parseFloat(stats.avg_comments) || 0
+      },
+      totals: {
+        views: parseInt(stats.total_views) || 0,
+        likes: parseInt(stats.total_likes) || 0,
+        shares: parseInt(stats.total_shares) || 0,
+        articles: parseInt(stats.total_articles) || 0
+      }
+    };
+  };
+
   return News;
+};
+
+// ================================
+// models/User.js - Enhanced with avatar support
+// ================================
+
+const { DataTypes } = require('sequelize');
+const bcrypt = require('bcryptjs');
+
+module.exports = (sequelize) => {
+  const User = sequelize.define('User', {
+    id: {
+      type: DataTypes.UUID,
+      defaultValue: DataTypes.UUIDV4,
+      primaryKey: true,
+      allowNull: false
+    },
+    email: {
+      type: DataTypes.STRING(255),
+      allowNull: false,
+      unique: true,
+      validate: {
+        isEmail: true,
+        notEmpty: true
+      }
+    },
+    password: {
+      type: DataTypes.STRING(255),
+      allowNull: false,
+      validate: {
+        len: [8, 255]
+      }
+    },
+    first_name: {
+      type: DataTypes.STRING(50),
+      allowNull: false,
+      validate: {
+        notEmpty: true,
+        len: [1, 50]
+      }
+    },
+    last_name: {
+      type: DataTypes.STRING(50),
+      allowNull: false,
+      validate: {
+        notEmpty: true,
+        len: [1, 50]
+      }
+    },
+    role: {
+      type: DataTypes.ENUM('super_admin', 'admin', 'editor', 'contributor'),
+      defaultValue: 'contributor',
+      allowNull: false
+    },
+    status: {
+      type: DataTypes.ENUM('active', 'inactive', 'suspended'),
+      defaultValue: 'active',
+      allowNull: false
+    },
+    // Enhanced avatar fields
+    avatar: {
+      type: DataTypes.STRING(255),
+      allowNull: true,
+      comment: 'Avatar image ID'
+    },
+    avatar_data: {
+      type: DataTypes.JSON,
+      allowNull: true,
+      comment: 'Avatar image data with all sizes'
+    },
+    bio: {
+      type: DataTypes.TEXT,
+      allowNull: true
+    },
+    phone: {
+      type: DataTypes.STRING(20),
+      allowNull: true
+    },
+    website: {
+      type: DataTypes.STRING(255),
+      allowNull: true,
+      validate: {
+        isUrl: true
+      }
+    },
+    social_links: {
+      type: DataTypes.JSON,
+      defaultValue: {},
+      allowNull: true,
+      comment: 'Social media links'
+    },
+    timezone: {
+      type: DataTypes.STRING(50),
+      defaultValue: 'UTC',
+      allowNull: false
+    },
+    language: {
+      type: DataTypes.STRING(5),
+      defaultValue: 'en',
+      allowNull: false
+    },
+    last_login: {
+      type: DataTypes.DATE,
+      allowNull: true
+    },
+    last_login_ip: {
+      type: DataTypes.STRING(45),
+      allowNull: true
+    },
+    login_count: {
+      type: DataTypes.INTEGER,
+      defaultValue: 0,
+      allowNull: false
+    },
+    email_verified: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+      allowNull: false
+    },
+    email_verification_token: {
+      type: DataTypes.STRING(255),
+      allowNull: true
+    },
+    password_reset_token: {
+      type: DataTypes.STRING(255),
+      allowNull: true
+    },
+    password_reset_expires: {
+      type: DataTypes.DATE,
+      allowNull: true
+    },
+    two_factor_enabled: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+      allowNull: false
+    },
+    two_factor_secret: {
+      type: DataTypes.STRING(255),
+      allowNull: true
+    },
+    preferences: {
+      type: DataTypes.JSON,
+      defaultValue: {
+        notifications: {
+          email: true,
+          push: false,
+          article_published: true,
+          article_commented: true
+        },
+        editor: {
+          autosave: true,
+          preview_mode: 'side',
+          default_visibility: 'public'
+        },
+        dashboard: {
+          articles_per_page: 10,
+          default_article_status: 'draft'
+        }
+      }
+    },
+    created_at: {
+      type: DataTypes.DATE,
+      defaultValue: DataTypes.NOW,
+      allowNull: false
+    },
+    updated_at: {
+      type: DataTypes.DATE,
+      defaultValue: DataTypes.NOW,
+      allowNull: false
+    }
+  }, {
+    tableName: 'users',
+    timestamps: true,
+    createdAt: 'created_at',
+    updatedAt: 'updated_at',
+    indexes: [
+      {
+        unique: true,
+        fields: ['email']
+      },
+      {
+        fields: ['role']
+      },
+      {
+        fields: ['status']
+      },
+      {
+        fields: ['created_at']
+      }
+    ],
+    hooks: {
+      beforeCreate: async (user) => {
+        if (user.password) {
+          user.password = await bcrypt.hash(user.password, 12);
+        }
+      },
+      
+      beforeUpdate: async (user) => {
+        if (user.changed('password')) {
+          user.password = await bcrypt.hash(user.password, 12);
+        }
+        user.updated_at = new Date();
+      }
+    }
+  });
+
+  // Instance methods
+  User.prototype.comparePassword = async function(candidatePassword) {
+    return await bcrypt.compare(candidatePassword, this.password);
+  };
+
+  User.prototype.getFullName = function() {
+    return `${this.first_name} ${this.last_name}`;
+  };
+
+  User.prototype.isActive = function() {
+    return this.status === 'active';
+  };
+
+  User.prototype.canEdit = function(resource) {
+    const permissions = {
+      super_admin: ['all'],
+      admin: ['users', 'news', 'categories', 'tags', 'settings'],
+      editor: ['news', 'categories', 'tags'],
+      contributor: ['news']
+    };
+    
+    return permissions[this.role].includes('all') || 
+           permissions[this.role].includes(resource);
+  };
+
+  User.prototype.canDelete = function(resource) {
+    const permissions = {
+      super_admin: ['all'],
+      admin: ['users', 'news', 'categories', 'tags'],
+      editor: ['news', 'tags'],
+      contributor: []
+    };
+    
+    return permissions[this.role].includes('all') || 
+           permissions[this.role].includes(resource);
+  };
+
+  User.prototype.canPublish = function() {
+    return ['super_admin', 'admin', 'editor'].includes(this.role);
+  };
+
+  // Enhanced avatar methods
+  User.prototype.getAvatarUrl = function(size = 'medium', baseUrl = null) {
+    if (!this.avatar_data || !this.avatar_data.images) {
+      return this.getGravatarUrl(size);
+    }
+    
+    const image = this.avatar_data.images[size];
+    if (!image) return this.getGravatarUrl(size);
+    
+    const domain = baseUrl || process.env.CDN_URL || process.env.BASE_URL || 'http://localhost:3000';
+    return `${domain}${image.path}`;
+  };
+
+  User.prototype.getGravatarUrl = function(size = 'medium') {
+    const crypto = require('crypto');
+    const hash = crypto.createHash('md5').update(this.email.toLowerCase()).digest('hex');
+    const sizeMap = {
+      thumbnail: 150,
+      small: 200,
+      medium: 300,
+      large: 400
+    };
+    const pixelSize = sizeMap[size] || 300;
+    return `https://www.gravatar.com/avatar/${hash}?s=${pixelSize}&d=identicon`;
+  };
+
+  User.prototype.toJSON = function() {
+    const values = Object.assign({}, this.get());
+    
+    // Remove sensitive fields
+    delete values.password;
+    delete values.email_verification_token;
+    delete values.password_reset_token;
+    delete values.two_factor_secret;
+    
+    // Add avatar URL
+    values.avatar_url = this.getAvatarUrl();
+    
+    return values;
+  };
+
+  // Class methods
+  User.findByEmail = async function(email) {
+    return await this.findOne({
+      where: { email: email.toLowerCase() }
+    });
+  };
+
+  User.findByRole = async function(role) {
+    return await this.findAll({
+      where: { role, status: 'active' }
+    });
+  };
+
+  User.getActiveCount = async function() {
+    return await this.count({
+      where: { status: 'active' }
+    });
+  };
+
+  User.getRoleHierarchy = function() {
+    return {
+      super_admin: 4,
+      admin: 3,
+      editor: 2,
+      contributor: 1
+    };
+  };
+
+  User.prototype.hasHigherRoleThan = function(otherUser) {
+    const hierarchy = User.getRoleHierarchy();
+    return hierarchy[this.role] > hierarchy[otherUser.role];
+  };
+
+  return User;
 };
