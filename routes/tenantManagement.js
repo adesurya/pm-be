@@ -3,7 +3,7 @@ const express = require('express');
 const { body, param, query } = require('express-validator');
 const router = express.Router();
 const { masterDB, createTenantDB, getTenantDB, initializeTenantModels } = require('../config/database');
-const { authenticateMasterAdmin } = require('./masterAuth');
+const { authenticateMasterAdmin } = require('./masterAuth.js.bak');
 
 // Validation middleware
 const handleValidationErrors = (req, res, next) => {

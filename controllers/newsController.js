@@ -2,7 +2,7 @@
 const { validationResult } = require('express-validator');
 const { Op } = require('sequelize');
 const logger = require('../utils/logger');
-const cacheService = require('../config/redis');
+const cacheService = require('../config/cache');
 const uploadService = require('../services/uploadService');
 const { sanitizeHtmlContent } = require('../middleware/security');
 
