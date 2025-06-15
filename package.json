@@ -1,0 +1,153 @@
+{
+  "name": "news-cms-saas",
+  "version": "1.0.0",
+  "description": "Multi-tenant News CMS SaaS Platform with automatic provisioning",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "dev:debug": "nodemon --inspect server.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "migrate": "node scripts/migrate.js",
+    "migrate:fresh": "node scripts/migrate.js fresh",
+    "migrate:sample": "node scripts/migrate.js sample",
+    "db:fix": "node scripts/fixDatabase.js fix",
+    "db:validate": "node scripts/fixDatabase.js validate",
+    "db:quickfix": "node scripts/quickFix.js",
+    "debug": "node scripts/startupDebug.js",
+    "tenant:create": "node scripts/tenantManager.js create",
+    "tenant:list": "node scripts/tenantManager.js list",
+    "tenant:delete": "node scripts/tenantManager.js delete",
+    "seed": "node scripts/seed.js",
+    "setup": "npm run setup:env && npm run setup:db",
+    "setup:env": "node scripts/setupEnv.js",
+    "setup:db": "node scripts/setupDatabase.js",
+    "setup:dev": "chmod +x dev-setup.sh && ./dev-setup.sh",
+    "test-api": "chmod +x test-api.sh && ./test-api.sh",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "logs": "tail -f logs/app.log",
+    "logs:error": "tail -f logs/error.log",
+    "logs:security": "tail -f logs/security.log",
+    "clean": "rm -rf node_modules package-lock.json && npm install",
+    "clean:logs": "rm -rf logs/*.log",
+    "backup:db": "node scripts/backupDatabase.js",
+    "restore:db": "node scripts/restoreDatabase.js",
+    "ssl:generate": "node scripts/generateSSL.js",
+    "nginx:config": "node scripts/generateNginxConfig.js",
+    "health": "curl -s http://localhost:3000/health | jq",
+    "master:status": "curl -s http://localhost:3000/api/master/status | jq",
+    "docs:generate": "node scripts/generateDocs.js",
+    "build": "echo 'No build step required for Node.js application'",
+    "postinstall": "echo 'Installation complete. Run npm run setup for first-time setup.'"
+  },
+  "dependencies": {
+    "axios": "^1.6.2",
+    "bcryptjs": "^2.4.3",
+    "commander": "^11.1.0",
+    "compression": "^1.7.4",
+    "connect-redis": "^7.1.0",
+    "cors": "^2.8.5",
+    "csurf": "^1.11.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "express-session": "^1.18.1",
+    "express-validator": "^7.0.1",
+    "express-winston": "^4.2.0",
+    "helmet": "^7.1.0",
+    "joi": "^17.11.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
+    "mysql2": "^3.6.5",
+    "redis": "^4.6.10",
+    "sanitize-html": "^2.11.0",
+    "sequelize": "^6.35.0",
+    "sharp": "^0.33.0",
+    "slugify": "^1.6.6",
+    "uuid": "^9.0.1",
+    "winston": "^3.11.0",
+    "xss": "^1.0.14"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.8",
+    "eslint": "^8.54.0",
+    "eslint-config-node": "^4.1.0",
+    "eslint-plugin-node": "^11.1.0",
+    "husky": "^8.0.3",
+    "jest": "^29.7.0",
+    "lint-staged": "^15.2.0",
+    "nodemon": "^3.0.2",
+    "prettier": "^3.1.0",
+    "supertest": "^6.3.3"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
+  },
+  "keywords": [
+    "news",
+    "cms",
+    "saas",
+    "multi-tenant",
+    "nodejs",
+    "express",
+    "mysql",
+    "sequelize",
+    "jwt",
+    "rest-api"
+  ],
+  "author": {
+    "name": "News CMS Team",
+    "email": "admin@newscms.com"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/news-cms-saas.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-org/news-cms-saas/issues"
+  },
+  "homepage": "https://github.com/your-org/news-cms-saas#readme",
+  "husky": {
+    "hooks": {
+      "pre-commit": "lint-staged"
+    }
+  },
+  "lint-staged": {
+    "*.js": [
+      "eslint --fix",
+      "prettier --write"
+    ],
+    "*.{json,md}": [
+      "prettier --write"
+    ]
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "coverageDirectory": "coverage",
+    "collectCoverageFrom": [
+      "**/*.js",
+      "!node_modules/**",
+      "!coverage/**",
+      "!logs/**",
+      "!scripts/**"
+    ]
+  },
+  "nodemonConfig": {
+    "ignore": [
+      "logs/*",
+      "uploads/*",
+      "coverage/*",
+      "*.test.js"
+    ],
+    "env": {
+      "NODE_ENV": "development"
+    }
+  }
+}

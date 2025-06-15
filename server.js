@@ -1,11 +1,12 @@
-// server-with-tenant-management.js - Server lengkap dengan tenant management
+// server-complete.js - Complete server with tenant and master admin support
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const session = require('express-session');
 require('dotenv').config();
 
-console.log('🚀 Starting News CMS SaaS server with full tenant management...');
+console.log('🚀 Starting Complete News CMS SaaS server...');
 
 // Create Express app
 const app = express();
@@ -20,6 +21,18 @@ let dbInitialized = false;
 // Basic middleware
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Session configuration
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'news-cms-session-secret',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: process.env.NODE_ENV === 'production',
+    httpOnly: true,
+    maxAge: 24 * 60 * 60 * 1000 // 24 hours
+  }
+}));
 
 // CORS
 app.use(cors({
@@ -156,7 +169,6 @@ const initializeDatabase = async () => {
         allowNull: true,
         unique: true
       },
-      // PERBAIKAN: Pastikan ENUM values sesuai
       status: {
         type: DataTypes.ENUM('active', 'inactive', 'suspended', 'provisioning'),
         defaultValue: 'provisioning',
@@ -185,11 +197,11 @@ const initializeDatabase = async () => {
       limits: {
         type: DataTypes.JSON,
         defaultValue: {
-          max_users: 5,
-          max_articles: 100,
-          max_categories: 20,
-          max_tags: 50,
-          storage_mb: 100
+          max_users: 9999999,
+          max_articles: 9999999,
+          max_categories: 9999999,
+          max_tags: 9999999,
+          storage_mb: 9999999
         },
         allowNull: true
       },
@@ -227,15 +239,13 @@ const initializeDatabase = async () => {
       updatedAt: 'updated_at',
       hooks: {
         beforeCreate: async (tenant) => {
-          // Generate database name if not provided
           if (!tenant.database_name) {
             tenant.database_name = `news_cms_tenant_${tenant.id.replace(/-/g, '_')}`;
           }
           
-          // Set trial end date for trial plans
           if (tenant.plan === 'trial' && !tenant.trial_ends_at) {
             const trialEnd = new Date();
-            trialEnd.setDate(trialEnd.getDate() + 30); // 30 days trial
+            trialEnd.setDate(trialEnd.getDate() + 30);
             tenant.trial_ends_at = trialEnd;
           }
         },
@@ -282,6 +292,14 @@ const initializeDatabase = async () => {
       return new Date() > this.trial_ends_at;
     };
     
+    Tenant.prototype.canCreateUser = function(currentCount) {
+      return currentCount < this.limits.max_users;
+    };
+    
+    Tenant.prototype.canCreateArticle = function(currentCount) {
+      return currentCount < this.limits.max_articles;
+    };
+    
     // Sync models to create tables
     await MasterAdmin.sync();
     await Tenant.sync();
@@ -299,7 +317,98 @@ const initializeDatabase = async () => {
   }
 };
 
-// Middleware untuk authenticating master admin
+// Tenant identification middleware
+const identifyTenant = async (req, res, next) => {
+  try {
+    const host = req.get('host');
+    
+    if (!host) {
+      // No host header, might be master admin request
+      return next();
+    }
+
+    // Remove port if present
+    const domain = host.split(':')[0];
+    
+    // Skip tenant identification for localhost without subdomain
+    if (domain === 'localhost' || domain === '127.0.0.1') {
+      return next();
+    }
+    
+    // Check if it's a subdomain (e.g., tenant1.localhost)
+    const parts = domain.split('.');
+    let tenant = null;
+
+    if (parts.length >= 2) {
+      // Try to find tenant by full domain first
+      tenant = await Tenant.findOne({
+        where: { domain: domain, status: 'active' }
+      });
+      
+      // If not found by domain, try subdomain
+      if (!tenant && parts.length >= 3) {
+        const subdomain = parts[0];
+        tenant = await Tenant.findOne({
+          where: { subdomain: subdomain, status: 'active' }
+        });
+      }
+    }
+
+    if (tenant) {
+      console.log(`✅ Tenant identified: ${tenant.name} (${tenant.domain})`);
+      req.tenant = tenant;
+      req.tenantId = tenant.id;
+      
+      // Update last activity
+      tenant.last_activity = new Date();
+      await tenant.save();
+    }
+
+    next();
+
+  } catch (error) {
+    console.error('Error identifying tenant:', error);
+    next(); // Continue without tenant context
+  }
+};
+
+// Load tenant database connection and models
+const loadTenantDB = async (req, res, next) => {
+  if (!req.tenantId) {
+    return next(); // No tenant, continue
+  }
+
+  try {
+    const { getTenantDB, initializeTenantModels } = require('./config/database');
+    
+    // Get tenant database connection
+    const tenantDB = await getTenantDB(req.tenantId);
+    
+    // Initialize models for this tenant
+    const models = await initializeTenantModels(tenantDB);
+
+    // Store in request for use in controllers
+    req.db = tenantDB;
+    req.models = models;
+
+    console.log(`✅ Tenant DB loaded for: ${req.tenantId}`);
+    next();
+
+  } catch (error) {
+    console.error('Error loading tenant database:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Tenant database connection error',
+      code: 'DB_CONNECTION_ERROR'
+    });
+  }
+};
+
+// Apply tenant middleware to all routes
+app.use(identifyTenant);
+app.use(loadTenantDB);
+
+// Master admin authentication middleware
 const authenticateMasterAdmin = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
@@ -362,16 +471,91 @@ const authenticateMasterAdmin = async (req, res, next) => {
   }
 };
 
-// Utility functions untuk tenant database
+// Tenant authentication middleware
+const authenticateTenantUser = async (req, res, next) => {
+  try {
+    if (!req.tenant) {
+      return res.status(400).json({
+        success: false,
+        message: 'Tenant context required',
+        code: 'NO_TENANT_CONTEXT'
+      });
+    }
+
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authorization token required',
+        code: 'NO_TOKEN'
+      });
+    }
+
+    const token = authHeader.substring(7);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'bulletproof-secret-key-2024');
+    
+    if (decoded.tenantId !== req.tenantId) {
+      return res.status(403).json({
+        success: false,
+        message: 'Token tenant mismatch',
+        code: 'TENANT_MISMATCH'
+      });
+    }
+
+    const user = await req.models.User.findByPk(decoded.userId);
+    
+    if (!user || !user.isActive()) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid or inactive user account',
+        code: 'INVALID_USER'
+      });
+    }
+
+    // Update user activity
+    user.last_login = new Date();
+    user.last_login_ip = req.ip;
+    user.login_count += 1;
+    await user.save();
+
+    req.currentUser = user;
+    next();
+
+  } catch (error) {
+    console.error('Tenant auth error:', error);
+    
+    if (error.name === 'JsonWebTokenError') {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid token',
+        code: 'INVALID_TOKEN'
+      });
+    }
+    
+    if (error.name === 'TokenExpiredError') {
+      return res.status(401).json({
+        success: false,
+        message: 'Token has expired',
+        code: 'TOKEN_EXPIRED'
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: 'Authentication error'
+    });
+  }
+};
+
+// Tenant database functions
 const createTenantDatabase = async (tenantId) => {
   try {
     const dbName = `news_cms_tenant_${tenantId.replace(/-/g, '_')}`;
     
-    // Create database
     await masterDB.query(`CREATE DATABASE IF NOT EXISTS \`${dbName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
     console.log(`✅ Tenant database created: ${dbName}`);
     
-    // Create tenant database connection
     const tenantDB = new masterDB.constructor(
       dbName,
       process.env.MASTER_DB_USER || 'root',
@@ -384,10 +568,9 @@ const createTenantDatabase = async (tenantId) => {
       }
     );
 
-    // Test connection
     await tenantDB.authenticate();
     
-    // Initialize basic tenant models (simplified)
+    // Initialize basic tenant models
     const User = tenantDB.define('User', {
       id: { type: masterDB.Sequelize.DataTypes.UUID, defaultValue: masterDB.Sequelize.DataTypes.UUIDV4, primaryKey: true },
       email: { type: masterDB.Sequelize.DataTypes.STRING, allowNull: false, unique: true },
@@ -397,6 +580,9 @@ const createTenantDatabase = async (tenantId) => {
       role: { type: masterDB.Sequelize.DataTypes.ENUM('admin', 'editor', 'contributor'), defaultValue: 'contributor' },
       status: { type: masterDB.Sequelize.DataTypes.ENUM('active', 'inactive'), defaultValue: 'active' },
       email_verified: { type: masterDB.Sequelize.DataTypes.BOOLEAN, defaultValue: false },
+      last_login: { type: masterDB.Sequelize.DataTypes.DATE, allowNull: true },
+      last_login_ip: { type: masterDB.Sequelize.DataTypes.STRING, allowNull: true },
+      login_count: { type: masterDB.Sequelize.DataTypes.INTEGER, defaultValue: 0 },
       created_at: { type: masterDB.Sequelize.DataTypes.DATE, defaultValue: masterDB.Sequelize.DataTypes.NOW },
       updated_at: { type: masterDB.Sequelize.DataTypes.DATE, defaultValue: masterDB.Sequelize.DataTypes.NOW }
     }, {
@@ -413,6 +599,31 @@ const createTenantDatabase = async (tenantId) => {
       }
     });
 
+    // Add user methods
+    User.prototype.comparePassword = async function(candidatePassword) {
+      return await bcrypt.compare(candidatePassword, this.password);
+    };
+
+    User.prototype.isActive = function() {
+      return this.status === 'active';
+    };
+
+    User.prototype.canPublish = function() {
+      return ['admin', 'editor'].includes(this.role);
+    };
+
+    User.prototype.toJSON = function() {
+      const values = Object.assign({}, this.get());
+      delete values.password;
+      return values;
+    };
+
+    User.findByEmail = async function(email) {
+      return await this.findOne({
+        where: { email: email.toLowerCase() }
+      });
+    };
+
     const Category = tenantDB.define('Category', {
       id: { type: masterDB.Sequelize.DataTypes.UUID, defaultValue: masterDB.Sequelize.DataTypes.UUIDV4, primaryKey: true },
       name: { type: masterDB.Sequelize.DataTypes.STRING, allowNull: false },
@@ -423,13 +634,61 @@ const createTenantDatabase = async (tenantId) => {
       created_at: { type: masterDB.Sequelize.DataTypes.DATE, defaultValue: masterDB.Sequelize.DataTypes.NOW }
     }, { tableName: 'categories', timestamps: false });
 
+    const Tag = tenantDB.define('Tag', {
+      id: { type: masterDB.Sequelize.DataTypes.UUID, defaultValue: masterDB.Sequelize.DataTypes.UUIDV4, primaryKey: true },
+      name: { type: masterDB.Sequelize.DataTypes.STRING, allowNull: false },
+      slug: { type: masterDB.Sequelize.DataTypes.STRING, allowNull: false, unique: true },
+      color: { type: masterDB.Sequelize.DataTypes.STRING, defaultValue: '#3B82F6' },
+      usage_count: { type: masterDB.Sequelize.DataTypes.INTEGER, defaultValue: 0 },
+      created_at: { type: masterDB.Sequelize.DataTypes.DATE, defaultValue: masterDB.Sequelize.DataTypes.NOW }
+    }, { tableName: 'tags', timestamps: false });
+
+    const News = tenantDB.define('News', {
+      id: { type: masterDB.Sequelize.DataTypes.UUID, defaultValue: masterDB.Sequelize.DataTypes.UUIDV4, primaryKey: true },
+      title: { type: masterDB.Sequelize.DataTypes.STRING, allowNull: false },
+      slug: { type: masterDB.Sequelize.DataTypes.STRING, allowNull: false, unique: true },
+      content: { type: masterDB.Sequelize.DataTypes.TEXT, allowNull: false },
+      excerpt: { type: masterDB.Sequelize.DataTypes.TEXT },
+      status: { type: masterDB.Sequelize.DataTypes.ENUM('draft', 'published', 'archived'), defaultValue: 'draft' },
+      visibility: { type: masterDB.Sequelize.DataTypes.ENUM('public', 'private'), defaultValue: 'public' },
+      author_id: { type: masterDB.Sequelize.DataTypes.UUID, allowNull: false },
+      category_id: { type: masterDB.Sequelize.DataTypes.UUID, allowNull: false },
+      views_count: { type: masterDB.Sequelize.DataTypes.INTEGER, defaultValue: 0 },
+      published_at: { type: masterDB.Sequelize.DataTypes.DATE },
+      created_at: { type: masterDB.Sequelize.DataTypes.DATE, defaultValue: masterDB.Sequelize.DataTypes.NOW },
+      updated_at: { type: masterDB.Sequelize.DataTypes.DATE, defaultValue: masterDB.Sequelize.DataTypes.NOW }
+    }, { 
+      tableName: 'news',
+      timestamps: true,
+      createdAt: 'created_at',
+      updatedAt: 'updated_at'
+    });
+
+    const NewsTag = tenantDB.define('NewsTag', {
+      id: { type: masterDB.Sequelize.DataTypes.UUID, defaultValue: masterDB.Sequelize.DataTypes.UUIDV4, primaryKey: true },
+      news_id: { type: masterDB.Sequelize.DataTypes.UUID, allowNull: false },
+      tag_id: { type: masterDB.Sequelize.DataTypes.UUID, allowNull: false },
+      created_at: { type: masterDB.Sequelize.DataTypes.DATE, defaultValue: masterDB.Sequelize.DataTypes.NOW }
+    }, { tableName: 'news_tags', timestamps: false });
+
+    // Define associations
+    User.hasMany(News, { foreignKey: 'author_id', as: 'articles' });
+    News.belongsTo(User, { foreignKey: 'author_id', as: 'author' });
+    Category.hasMany(News, { foreignKey: 'category_id', as: 'articles' });
+    News.belongsTo(Category, { foreignKey: 'category_id', as: 'category' });
+    News.belongsToMany(Tag, { through: NewsTag, foreignKey: 'news_id', otherKey: 'tag_id', as: 'tags' });
+    Tag.belongsToMany(News, { through: NewsTag, foreignKey: 'tag_id', otherKey: 'news_id', as: 'articles' });
+
     // Sync tenant models
     await User.sync();
     await Category.sync();
+    await Tag.sync();
+    await News.sync();
+    await NewsTag.sync();
     
     console.log(`✅ Tenant models created for: ${tenantId}`);
     
-    return { tenantDB, User, Category };
+    return { tenantDB, User, Category, Tag, News, NewsTag };
     
   } catch (error) {
     console.error(`❌ Failed to create tenant database for ${tenantId}:`, error);
@@ -437,17 +696,40 @@ const createTenantDatabase = async (tenantId) => {
   }
 };
 
+// Helper function to generate secure password
+function generateSecurePassword(length = 12) {
+  const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
+  let password = '';
+  
+  password += 'abcdefghijklmnopqrstuvwxyz'[Math.floor(Math.random() * 26)];
+  password += 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[Math.floor(Math.random() * 26)];
+  password += '0123456789'[Math.floor(Math.random() * 10)];
+  password += '!@#$%^&*'[Math.floor(Math.random() * 8)];
+  
+  for (let i = password.length; i < length; i++) {
+    password += charset[Math.floor(Math.random() * charset.length)];
+  }
+  
+  return password.split('').sort(() => Math.random() - 0.5).join('');
+}
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({
     success: true,
-    message: 'News CMS SaaS is running (Full Mode)',
+    message: 'News CMS SaaS is running',
     timestamp: new Date().toISOString(),
-    version: '1.0.0-full',
-    mode: 'full',
+    version: '1.0.0-complete',
+    tenant: req.tenant ? {
+      id: req.tenant.id,
+      name: req.tenant.name,
+      domain: req.tenant.domain
+    } : null,
     database_initialized: dbInitialized
   });
 });
+
+// =================== MASTER ADMIN ENDPOINTS ===================
 
 // Master admin status
 app.get('/api/master/status', async (req, res) => {
@@ -461,9 +743,8 @@ app.get('/api/master/status', async (req, res) => {
       requires_setup: true,
       database_connected: false,
       database_initialized: dbInitialized,
-      version: '1.0.0-full',
-      timestamp: new Date().toISOString(),
-      mode: 'full'
+      version: '1.0.0-complete',
+      timestamp: new Date().toISOString()
     }
   };
 
@@ -532,13 +813,6 @@ app.post('/api/master/setup', async (req, res) => {
     
     if (!dbInitialized) {
       await initializeDatabase();
-    }
-    
-    if (!dbInitialized || !masterDB || !MasterAdmin) {
-      return res.status(500).json({
-        success: false,
-        message: 'Database not available'
-      });
     }
     
     const existingCount = await MasterAdmin.count();
@@ -660,7 +934,8 @@ app.get('/api/master/profile', authenticateMasterAdmin, async (req, res) => {
   }
 });
 
-// TENANT MANAGEMENT ENDPOINTS
+// =================== TENANT MANAGEMENT ENDPOINTS ===================
+
 // Get all tenants
 app.get('/api/tenant-management', authenticateMasterAdmin, async (req, res) => {
   try {
@@ -714,38 +989,20 @@ app.post('/api/tenant-management', authenticateMasterAdmin, async (req, res) => 
   try {
     const { name, domain, subdomain, contact_email, contact_name, plan = 'trial' } = req.body;
 
-    // Validasi input required
     if (!name || !domain || !contact_email || !contact_name) {
       return res.status(400).json({
         success: false,
         message: 'Missing required fields',
-        required: ['name', 'domain', 'contact_email', 'contact_name'],
-        received: {
-          name: !!name,
-          domain: !!domain,
-          contact_email: !!contact_email,
-          contact_name: !!contact_name
-        }
+        required: ['name', 'domain', 'contact_email', 'contact_name']
       });
     }
 
-    // Validasi plan value
     const validPlans = ['trial', 'basic', 'professional', 'enterprise'];
     if (!validPlans.includes(plan)) {
       return res.status(400).json({
         success: false,
         message: 'Invalid plan value',
-        valid_plans: validPlans,
-        received: plan
-      });
-    }
-
-    // Validasi email format
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(contact_email)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid email format'
+        valid_plans: validPlans
       });
     }
 
@@ -754,7 +1011,6 @@ app.post('/api/tenant-management', authenticateMasterAdmin, async (req, res) => 
     // Check if domain already exists
     const whereConditions = [{ domain: domain.trim() }];
     
-    // Hanya tambahkan kondisi subdomain jika subdomain tidak undefined/null
     if (subdomain && subdomain.trim() !== '') {
       whereConditions.push({ subdomain: subdomain.trim() });
     }
@@ -769,31 +1025,25 @@ app.post('/api/tenant-management', authenticateMasterAdmin, async (req, res) => 
       return res.status(409).json({
         success: false,
         message: 'Domain already exists',
-        code: 'DOMAIN_EXISTS',
-        existing_domain: existingTenant.domain
+        code: 'DOMAIN_EXISTS'
       });
     }
 
-    // Prepare tenant data dengan validasi yang ketat
+    // Create tenant record
     const tenantData = {
       name: name.trim(),
       domain: domain.trim(),
       contact_email: contact_email.trim().toLowerCase(),
       contact_name: contact_name.trim(),
-      status: 'provisioning', // PASTIKAN value ini ada di ENUM
-      plan: plan // Sudah divalidasi di atas
+      status: 'provisioning',
+      plan: plan
     };
 
-    // Hanya set subdomain jika ada dan tidak kosong
     if (subdomain && subdomain.trim() !== '') {
       tenantData.subdomain = subdomain.trim();
     }
 
-    console.log('Creating tenant with data:', JSON.stringify(tenantData, null, 2));
-
-    // Create tenant record
     const tenant = await Tenant.create(tenantData);
-
     console.log(`✅ Tenant record created: ${tenant.id}`);
 
     try {
@@ -843,8 +1093,8 @@ app.post('/api/tenant-management', authenticateMasterAdmin, async (req, res) => 
             domain: tenant.domain,
             database_created: true,
             admin_created: true,
-            ssl_enabled: false, // Development mode
-            nginx_configured: false // Development mode
+            ssl_enabled: false,
+            nginx_configured: false
           },
           admin_credentials: {
             email: contact_email.trim().toLowerCase(),
@@ -870,7 +1120,6 @@ app.post('/api/tenant-management', authenticateMasterAdmin, async (req, res) => 
     } catch (dbError) {
       console.error('Database creation failed:', dbError);
       
-      // Cleanup: delete tenant record if database creation failed
       try {
         await tenant.destroy();
         console.log('Cleaned up failed tenant record');
@@ -884,7 +1133,6 @@ app.post('/api/tenant-management', authenticateMasterAdmin, async (req, res) => 
   } catch (error) {
     console.error('Create tenant error:', error);
     
-    // Provide more detailed error information
     let errorMessage = 'Tenant creation failed';
     let errorDetails = error.message;
     let errorCode = 'CREATION_ERROR';
@@ -897,90 +1145,13 @@ app.post('/api/tenant-management', authenticateMasterAdmin, async (req, res) => 
       errorMessage = 'Duplicate entry';
       errorDetails = 'Domain or subdomain already exists';
       errorCode = 'DUPLICATE_ENTRY';
-    } else if (error.name === 'SequelizeDatabaseError') {
-      if (error.message.includes('Data truncated')) {
-        errorMessage = 'Invalid data format';
-        errorDetails = 'One or more fields contain invalid values';
-        errorCode = 'INVALID_DATA';
-      }
     }
     
     res.status(500).json({
       success: false,
       message: errorMessage,
       error: errorDetails,
-      code: errorCode,
-      debug_info: process.env.NODE_ENV === 'development' ? {
-        error_name: error.name,
-        sql_message: error.sqlMessage,
-        sql_state: error.sqlState
-      } : undefined
-    });
-  }
-});
-
-// Get single tenant
-app.get('/api/tenant-management/:id', authenticateMasterAdmin, async (req, res) => {
-  try {
-    const tenant = await Tenant.findByPk(req.params.id, {
-      attributes: { exclude: ['database_name'] }
-    });
-
-    if (!tenant) {
-      return res.status(404).json({
-        success: false,
-        message: 'Tenant not found'
-      });
-    }
-
-    res.json({
-      success: true,
-      data: { tenant }
-    });
-
-  } catch (error) {
-    console.error('Get tenant error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch tenant'
-    });
-  }
-});
-
-// Update tenant
-app.put('/api/tenant-management/:id', authenticateMasterAdmin, async (req, res) => {
-  try {
-    const tenant = await Tenant.findByPk(req.params.id);
-
-    if (!tenant) {
-      return res.status(404).json({
-        success: false,
-        message: 'Tenant not found'
-      });
-    }
-
-    const { name, contact_email, contact_name, status, plan } = req.body;
-    const updateData = {};
-    
-    if (name !== undefined) updateData.name = name;
-    if (contact_email !== undefined) updateData.contact_email = contact_email;
-    if (contact_name !== undefined) updateData.contact_name = contact_name;
-    if (status !== undefined) updateData.status = status;
-    if (plan !== undefined) updateData.plan = plan;
-
-    await tenant.update(updateData);
-
-    res.json({
-      success: true,
-      message: 'Tenant updated successfully',
-      data: { tenant }
-    });
-
-  } catch (error) {
-    console.error('Update tenant error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to update tenant'
+      code: errorCode
     });
   }
 });
@@ -1030,468 +1201,333 @@ app.delete('/api/tenant-management/:id', authenticateMasterAdmin, async (req, re
   }
 });
 
-// Get tenant analytics
-app.get('/api/tenant-management/:id/analytics', authenticateMasterAdmin, async (req, res) => {
+// =================== TENANT USER ENDPOINTS ===================
+
+// Tenant user login
+app.post('/api/auth/login', (req, res, next) => {
+  if (!req.tenant) {
+    return res.status(400).json({
+      success: false,
+      message: 'Tenant context required. Please check your Host header.',
+      code: 'NO_TENANT_CONTEXT',
+      help: 'Use Host header like: Host: yourdomain.com'
+    });
+  }
+  next();
+}, async (req, res) => {
   try {
-    const tenantId = req.params.id;
+    const { email, password } = req.body;
     
-    // Validate tenant ID format
-    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    if (!uuidRegex.test(tenantId)) {
+    if (!email || !password) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid tenant ID format',
-        code: 'INVALID_TENANT_ID'
+        message: 'Email and password are required'
       });
     }
 
-    // Find tenant
-    const tenant = await Tenant.findByPk(tenantId, {
-      attributes: { exclude: ['database_name'] }
-    });
-
-    if (!tenant) {
-      return res.status(404).json({
+    const user = await req.models.User.findByEmail(email);
+    if (!user) {
+      return res.status(401).json({
         success: false,
-        message: 'Tenant not found',
-        code: 'TENANT_NOT_FOUND'
+        message: 'Invalid email or password',
+        code: 'INVALID_CREDENTIALS'
       });
     }
 
-    console.log(`Getting analytics for tenant: ${tenant.name} (${tenantId})`);
-
-    // Initialize default analytics
-    let analytics = {
-      usage: {
-        users: 0,
-        articles: 0,
-        categories: 0,
-        tags: 0
-      },
-      limits: {
-        max_users: 999999999, // No practical limit
-        max_articles: 999999999, // No practical limit
-        max_categories: 999999999, // No practical limit
-        max_tags: 999999999, // No practical limit
-        storage_mb: 999999999 // No practical limit
-      },
-      usage_percentage: {
-        users: 0,
-        articles: 0,
-        categories: 0,
-        tags: 0
-      },
-      content_stats: {
-        published_articles: 0,
-        draft_articles: 0,
-        total_views: 0,
-        recent_activity: 0
-      },
-      plan_info: {
-        current_plan: tenant.plan,
-        status: tenant.status,
-        trial_ends_at: tenant.trial_ends_at,
-        created_at: tenant.created_at
-      },
-      tenant_info: {
-        id: tenant.id,
-        name: tenant.name,
-        domain: tenant.domain,
-        subdomain: tenant.subdomain
-      }
-    };
-
-    // Try to get tenant database stats
-    try {
-      console.log(`Connecting to tenant database for: ${tenantId}`);
-      
-      // Create tenant database connection
-      const dbName = `news_cms_tenant_${tenantId.replace(/-/g, '_')}`;
-      
-      const tenantDB = new masterDB.constructor(
-        dbName,
-        process.env.MASTER_DB_USER || 'root',
-        process.env.MASTER_DB_PASS || '',
-        {
-          host: process.env.MASTER_DB_HOST || 'localhost',
-          port: process.env.MASTER_DB_PORT || 3306,
-          dialect: 'mysql',
-          logging: false
-        }
-      );
-
-      // Test connection
-      await tenantDB.authenticate();
-      console.log(`✅ Connected to tenant database: ${dbName}`);
-
-      // Get table counts using raw queries (more reliable)
-      const [userCountResult] = await tenantDB.query('SELECT COUNT(*) as count FROM users WHERE 1=1');
-      const [articleCountResult] = await tenantDB.query('SELECT COUNT(*) as count FROM news WHERE 1=1');
-      const [categoryCountResult] = await tenantDB.query('SELECT COUNT(*) as count FROM categories WHERE 1=1');
-      const [tagCountResult] = await tenantDB.query('SELECT COUNT(*) as count FROM tags WHERE 1=1');
-      
-      // Get content stats
-      const [publishedResult] = await tenantDB.query("SELECT COUNT(*) as count FROM news WHERE status = 'published'");
-      const [draftResult] = await tenantDB.query("SELECT COUNT(*) as count FROM news WHERE status = 'draft'");
-      const [viewsResult] = await tenantDB.query('SELECT SUM(views_count) as total FROM news WHERE views_count IS NOT NULL');
-      
-      // Get recent activity (last 30 days)
-      const thirtyDaysAgo = new Date();
-      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-      const formattedDate = thirtyDaysAgo.toISOString().slice(0, 19).replace('T', ' ');
-      
-      const [recentResult] = await tenantDB.query(`SELECT COUNT(*) as count FROM news WHERE created_at >= '${formattedDate}'`);
-
-      // Update analytics with real data
-      const userCount = userCountResult[0]?.count || 0;
-      const articleCount = articleCountResult[0]?.count || 0;
-      const categoryCount = categoryCountResult[0]?.count || 0;
-      const tagCount = tagCountResult[0]?.count || 0;
-
-      analytics.usage = {
-        users: parseInt(userCount),
-        articles: parseInt(articleCount),
-        categories: parseInt(categoryCount),
-        tags: parseInt(tagCount)
-      };
-
-      analytics.content_stats = {
-        published_articles: parseInt(publishedResult[0]?.count || 0),
-        draft_articles: parseInt(draftResult[0]?.count || 0),
-        total_views: parseInt(viewsResult[0]?.total || 0),
-        recent_activity: parseInt(recentResult[0]?.count || 0)
-      };
-
-      // Calculate usage percentages (will be very low since limits are high)
-      analytics.usage_percentage = {
-        users: Math.round((analytics.usage.users / analytics.limits.max_users) * 100 * 100) / 100, // 2 decimal places
-        articles: Math.round((analytics.usage.articles / analytics.limits.max_articles) * 100 * 100) / 100,
-        categories: Math.round((analytics.usage.categories / analytics.limits.max_categories) * 100 * 100) / 100,
-        tags: Math.round((analytics.usage.tags / analytics.limits.max_tags) * 100 * 100) / 100
-      };
-
-      // Close tenant DB connection
-      await tenantDB.close();
-      console.log(`✅ Analytics retrieved for tenant: ${tenant.name}`);
-
-    } catch (dbError) {
-      console.error(`❌ Failed to get tenant database stats for ${tenantId}:`, dbError.message);
-      
-      // Return default analytics with error info
-      analytics.database_error = {
-        message: 'Could not connect to tenant database',
-        details: dbError.message,
-        note: 'This may be normal if tenant was just created'
-      };
-    }
-
-    res.json({
-      success: true,
-      data: {
-        tenant: analytics.tenant_info,
-        analytics: {
-          usage: analytics.usage,
-          limits: analytics.limits,
-          usage_percentage: analytics.usage_percentage,
-          content_stats: analytics.content_stats,
-          plan_info: analytics.plan_info
-        },
-        database_error: analytics.database_error,
-        timestamp: new Date().toISOString()
-      }
-    });
-
-  } catch (error) {
-    console.error('Get tenant analytics error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to get tenant analytics',
-      error: error.message,
-      code: 'ANALYTICS_ERROR'
-    });
-  }
-});
-
-// Get tenant status/health
-app.get('/api/tenant-management/:id/status', authenticateMasterAdmin, async (req, res) => {
-  try {
-    const tenantId = req.params.id;
-    
-    const tenant = await Tenant.findByPk(tenantId);
-
-    if (!tenant) {
-      return res.status(404).json({
+    if (!user.isActive()) {
+      return res.status(403).json({
         success: false,
-        message: 'Tenant not found',
-        code: 'TENANT_NOT_FOUND'
+        message: 'User account is not active',
+        code: 'USER_INACTIVE'
       });
     }
 
-    // Check tenant database connection
-    let databaseStatus = {
-      status: 'unknown',
-      message: 'Not checked'
-    };
-
-    try {
-      const dbName = `news_cms_tenant_${tenantId.replace(/-/g, '_')}`;
-      const tenantDB = new masterDB.constructor(
-        dbName,
-        process.env.MASTER_DB_USER || 'root',
-        process.env.MASTER_DB_PASS || '',
-        {
-          host: process.env.MASTER_DB_HOST || 'localhost',
-          port: process.env.MASTER_DB_PORT || 3306,
-          dialect: 'mysql',
-          logging: false
-        }
-      );
-
-      await tenantDB.authenticate();
-      await tenantDB.close();
-
-      databaseStatus = {
-        status: 'connected',
-        message: 'Database connection successful',
-        database_name: dbName
-      };
-
-    } catch (dbError) {
-      databaseStatus = {
-        status: 'failed',
-        message: 'Database connection failed',
-        error: dbError.message
-      };
-    }
-
-    const status = {
-      tenant_status: tenant.status,
-      domain: tenant.domain,
-      database: databaseStatus,
-      plan: tenant.plan,
-      created_at: tenant.created_at,
-      last_activity: tenant.last_activity,
-      last_checked: new Date().toISOString()
-    };
-
-    res.json({
-      success: true,
-      data: {
-        tenant: {
-          id: tenant.id,
-          name: tenant.name,
-          domain: tenant.domain,
-          status: tenant.status
-        },
-        health: status
-      }
-    });
-
-  } catch (error) {
-    console.error('Get tenant status error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to get tenant status'
-    });
-  }
-});
-
-//Endpoint untuk update semua tenant limits
-app.post('/api/tenant-management/update-limits', authenticateMasterAdmin, async (req, res) => {
-  try {
-    await updateTenantLimits();
-    
-    res.json({
-      success: true,
-      message: 'All tenant limits updated successfully',
-      new_limits: {
-        max_users: 999999,
-        max_articles: 999999,
-        max_categories: 999999,
-        max_tags: 999999,
-        storage_mb: 999999
-      }
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Failed to update tenant limits',
-      error: error.message
-    });
-  }
-});
-
-//Endpoint untuk seed data tenant (untuk testing)
-app.post('/api/tenant-management/:id/seed', authenticateMasterAdmin, async (req, res) => {
-  try {
-    const tenantId = req.params.id;
-    
-    const tenant = await Tenant.findByPk(tenantId);
-    if (!tenant) {
-      return res.status(404).json({
+    const isValidPassword = await user.comparePassword(password);
+    if (!isValidPassword) {
+      return res.status(401).json({
         success: false,
-        message: 'Tenant not found'
+        message: 'Invalid email or password',
+        code: 'INVALID_CREDENTIALS'
       });
     }
 
-    // Connect to tenant database
-    const dbName = `news_cms_tenant_${tenantId.replace(/-/g, '_')}`;
-    const tenantDB = new masterDB.constructor(
-      dbName,
-      process.env.MASTER_DB_USER || 'root',
-      process.env.MASTER_DB_PASS || '',
+    // Generate JWT token
+    const token = jwt.sign(
       {
-        host: process.env.MASTER_DB_HOST || 'localhost',
-        port: process.env.MASTER_DB_PORT || 3306,
-        dialect: 'mysql',
-        logging: false
-      }
+        userId: user.id,
+        email: user.email,
+        role: user.role,
+        tenantId: req.tenantId
+      },
+      process.env.JWT_SECRET || 'bulletproof-secret-key-2024',
+      { expiresIn: '24h' }
     );
 
-    await tenantDB.authenticate();
-
-    // Create sample categories
-    await tenantDB.query(`
-      INSERT IGNORE INTO categories (id, name, slug, description, color, is_featured, created_at) VALUES
-      (UUID(), 'Technology', 'technology', 'Latest technology news', '#3B82F6', 1, NOW()),
-      (UUID(), 'Business', 'business', 'Business and finance news', '#10B981', 1, NOW()),
-      (UUID(), 'Sports', 'sports', 'Sports news and updates', '#F59E0B', 0, NOW()),
-      (UUID(), 'Health', 'health', 'Health and wellness', '#EF4444', 0, NOW()),
-      (UUID(), 'Entertainment', 'entertainment', 'Entertainment news', '#8B5CF6', 0, NOW())
-    `);
-
-    // Create sample tags
-    await tenantDB.query(`
-      INSERT IGNORE INTO tags (id, name, slug, color, created_at) VALUES
-      (UUID(), 'breaking', 'breaking', '#EF4444', NOW()),
-      (UUID(), 'trending', 'trending', '#8B5CF6', NOW()),
-      (UUID(), 'featured', 'featured', '#06B6D4', NOW()),
-      (UUID(), 'latest', 'latest', '#10B981', NOW()),
-      (UUID(), 'popular', 'popular', '#F59E0B', NOW())
-    `);
-
-    await tenantDB.close();
+    // Update login info
+    user.last_login = new Date();
+    user.last_login_ip = req.ip;
+    user.login_count += 1;
+    await user.save();
 
     res.json({
       success: true,
-      message: 'Sample data created successfully',
+      message: 'Login successful',
       data: {
-        categories_created: 5,
-        tags_created: 5,
-        note: 'You can now create articles using these categories and tags'
+        user: user.toJSON(),
+        token,
+        token_type: 'Bearer',
+        expires_in: '24h',
+        tenant: {
+          id: req.tenant.id,
+          name: req.tenant.name,
+          domain: req.tenant.domain
+        }
       }
     });
 
   } catch (error) {
-    console.error('Seed tenant error:', error);
+    console.error('Tenant login error:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to create sample data',
-      error: error.message
+      message: 'Login failed'
     });
   }
 });
 
-// Helper function untuk generate secure password
-function generateSecurePassword(length = 12) {
-  const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
-  let password = '';
-  
-  // Ensure password has at least one of each required character type
-  password += 'abcdefghijklmnopqrstuvwxyz'[Math.floor(Math.random() * 26)]; // lowercase
-  password += 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[Math.floor(Math.random() * 26)]; // uppercase
-  password += '0123456789'[Math.floor(Math.random() * 10)]; // digit
-  password += '!@#$%^&*'[Math.floor(Math.random() * 8)]; // special
-  
-  // Fill remaining length
-  for (let i = password.length; i < length; i++) {
-    password += charset[Math.floor(Math.random() * charset.length)];
-  }
-  
-  // Shuffle password
-  return password.split('').sort(() => Math.random() - 0.5).join('');
-};
-
-const syncDatabase = async () => {
+// Get tenant user profile
+app.get('/api/auth/profile', authenticateTenantUser, async (req, res) => {
   try {
-    // Drop dan recreate tabel jika ada perubahan struktur
-    if (process.env.NODE_ENV === 'development') {
-      console.log('🔄 Syncing database with force...');
-      await MasterAdmin.sync({ force: false });
-      await Tenant.sync({ force: false }); // Gunakan force: true jika ingin drop tabel
-      console.log('✅ Database synced successfully');
-    } else {
-      await MasterAdmin.sync();
-      await Tenant.sync();
-    }
-  } catch (error) {
-    console.error('❌ Database sync failed:', error);
-    throw error;
-  }
-};
-
-// API docs
-app.get('/api/docs', (req, res) => {
-  res.json({
-    success: true,
-    message: 'News CMS SaaS API Documentation (Full Mode)',
-    version: '1.0.0-full',
-    mode: 'full',
-    database_initialized: dbInitialized,
-    endpoints: {
-      health: 'GET /health - System health check',
-      docs: 'GET /api/docs - API documentation',
-      master_auth: {
-        status: 'GET /api/master/status - Check setup status',
-        setup: 'POST /api/master/setup - Setup first master admin',
-        login: 'POST /api/master/login - Master admin login',
-        profile: 'GET /api/master/profile - Get admin profile'
-      },
-      tenant_management: {
-        list: 'GET /api/tenant-management - List all tenants',
-        create: 'POST /api/tenant-management - Create new tenant',
-        get: 'GET /api/tenant-management/:id - Get tenant details',
-        update: 'PUT /api/tenant-management/:id - Update tenant',
-        delete: 'DELETE /api/tenant-management/:id - Delete tenant'
+    res.json({
+      success: true,
+      data: {
+        user: req.currentUser.toJSON(),
+        tenant: {
+          id: req.tenant.id,
+          name: req.tenant.name,
+          domain: req.tenant.domain,
+          plan: req.tenant.plan
+        }
       }
-    },
-    quick_start: {
-      step_1: 'Check status: GET /api/master/status',
-      step_2: 'Setup admin: POST /api/master/setup',
-      step_3: 'Login: POST /api/master/login',
-      step_4: 'Create tenant: POST /api/tenant-management',
-      step_5: 'Access tenant via domain'
-    }
-  });
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get profile'
+    });
+  }
 });
 
-// Basic API endpoint
-app.get('/api', (req, res) => {
-  res.json({
-    success: true,
-    message: 'News CMS SaaS API (Full Mode)',
-    version: '1.0.0-full',
-    status: 'running',
-    mode: 'full',
-    database_initialized: dbInitialized,
-    available_endpoints: [
-      'GET /health',
-      'GET /api/docs',
-      'GET /api/master/status',
-      'POST /api/master/setup',
-      'POST /api/master/login',
-      'GET /api/master/profile',
-      'GET /api/tenant-management',
-      'POST /api/tenant-management',
-      'GET /api/tenant-management/:id',
-      'PUT /api/tenant-management/:id',
-      'DELETE /api/tenant-management/:id',
-      'GET /api/tenant-management/:id/analytics',      // BARU
-      'GET /api/tenant-management/:id/status',         // BARU
-      'POST /api/tenant-management/:id/seed',          // BARU
-      'POST /api/tenant-management/update-limits' 
-    ]
-  });
+// =================== NEWS ENDPOINTS ===================
+
+// Get all news articles
+app.get('/api/news', (req, res, next) => {
+  if (!req.tenant) {
+    return res.status(400).json({
+      success: false,
+      message: 'Tenant context required',
+      code: 'NO_TENANT_CONTEXT'
+    });
+  }
+  next();
+}, async (req, res) => {
+  try {
+    const { page = 1, limit = 10, status, search } = req.query;
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    const pageLimit = Math.min(parseInt(limit), 50);
+
+    const where = {};
+    if (status) where.status = status;
+    if (search) {
+      where[masterDB.Sequelize.Op.or] = [
+        { title: { [masterDB.Sequelize.Op.like]: `%${search}%` } },
+        { content: { [masterDB.Sequelize.Op.like]: `%${search}%` } }
+      ];
+    }
+
+    const { count, rows: articles } = await req.models.News.findAndCountAll({
+      where,
+      include: [
+        {
+          model: req.models.User,
+          as: 'author',
+          attributes: ['id', 'first_name', 'last_name', 'email']
+        },
+        {
+          model: req.models.Category,
+          as: 'category',
+          attributes: ['id', 'name', 'slug', 'color']
+        }
+      ],
+      order: [['created_at', 'DESC']],
+      limit: pageLimit,
+      offset
+    });
+
+    const totalPages = Math.ceil(count / pageLimit);
+
+    res.json({
+      success: true,
+      data: {
+        articles,
+        pagination: {
+          current_page: parseInt(page),
+          total_pages: totalPages,
+          total_items: count,
+          items_per_page: pageLimit
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Get news error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch articles'
+    });
+  }
+});
+
+// Create new article
+app.post('/api/news', authenticateTenantUser, async (req, res) => {
+  try {
+    const { title, content, excerpt, category_id, status = 'draft' } = req.body;
+
+    if (!title || !content || !category_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields',
+        required: ['title', 'content', 'category_id']
+      });
+    }
+
+    // Generate slug from title
+    const slugify = require('slugify');
+    const slug = slugify(title, {
+      lower: true,
+      strict: true,
+      remove: /[*+~.()'"!:@]/g
+    });
+
+    const articleData = {
+      title: title.trim(),
+      slug,
+      content,
+      excerpt: excerpt || null,
+      category_id,
+      status,
+      author_id: req.currentUser.id,
+      visibility: 'public'
+    };
+
+    if (status === 'published') {
+      articleData.published_at = new Date();
+    }
+
+    const article = await req.models.News.create(articleData);
+
+    // Fetch created article with associations
+    const createdArticle = await req.models.News.findByPk(article.id, {
+      include: [
+        {
+          model: req.models.User,
+          as: 'author',
+          attributes: ['id', 'first_name', 'last_name', 'email']
+        },
+        {
+          model: req.models.Category,
+          as: 'category',
+          attributes: ['id', 'name', 'slug', 'color']
+        }
+      ]
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Article created successfully',
+      data: { article: createdArticle }
+    });
+
+  } catch (error) {
+    console.error('Create article error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create article'
+    });
+  }
+});
+
+// =================== CATEGORIES ENDPOINTS ===================
+
+// Get all categories
+app.get('/api/categories', (req, res, next) => {
+  if (!req.tenant) {
+    return res.status(400).json({
+      success: false,
+      message: 'Tenant context required',
+      code: 'NO_TENANT_CONTEXT'
+    });
+  }
+  next();
+}, async (req, res) => {
+  try {
+    const categories = await req.models.Category.findAll({
+      order: [['name', 'ASC']]
+    });
+
+    res.json({
+      success: true,
+      data: { categories }
+    });
+
+  } catch (error) {
+    console.error('Get categories error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch categories'
+    });
+  }
+});
+
+// Create new category
+app.post('/api/categories', authenticateTenantUser, async (req, res) => {
+  try {
+    const { name, description, color = '#3B82F6' } = req.body;
+
+    if (!name) {
+      return res.status(400).json({
+        success: false,
+        message: 'Category name is required'
+      });
+    }
+
+    // Generate slug from name
+    const slugify = require('slugify');
+    const slug = slugify(name, {
+      lower: true,
+      strict: true,
+      remove: /[*+~.()'"!:@]/g
+    });
+
+    const category = await req.models.Category.create({
+      name: name.trim(),
+      slug,
+      description: description || null,
+      color
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Category created successfully',
+      data: { category }
+    });
+
+  } catch (error) {
+    console.error('Create category error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create category'
+    });
+  }
 });
 
 // Error handler
@@ -1501,7 +1537,7 @@ app.use((err, req, res, next) => {
     success: false,
     message: 'Internal server error',
     error: err.message,
-    mode: 'full'
+    tenant: req.tenant?.domain || 'none'
   });
 });
 
@@ -1511,29 +1547,31 @@ app.use('*', (req, res) => {
     success: false,
     message: 'Endpoint not found',
     path: req.originalUrl,
-    mode: 'full',
-    available_endpoints: [
-      'GET /health',
-      'GET /api/docs',
-      'GET /api/master/status',
-      'POST /api/master/setup',
-      'POST /api/master/login',
-      'GET /api/master/profile',
-      'GET /api/tenant-management',
-      'POST /api/tenant-management',
-      'GET /api/tenant-management/:id',
-      'PUT /api/tenant-management/:id',
-      'DELETE /api/tenant-management/:id'
-    ]
+    tenant: req.tenant ? {
+      domain: req.tenant.domain,
+      available_endpoints: [
+        'POST /api/auth/login',
+        'GET /api/news',
+        'POST /api/news',
+        'GET /api/categories',
+        'POST /api/categories'
+      ]
+    } : {
+      available_endpoints: [
+        'GET /health',
+        'GET /api/master/status',
+        'POST /api/master/setup',
+        'POST /api/master/login'
+      ]
+    }
   });
 });
 
 // Start server
 const startServer = async () => {
   try {
-    console.log('🔧 Starting full News CMS SaaS server...');
+    console.log('🔧 Starting complete News CMS SaaS server...');
     
-    // Check environment
     console.log('Environment check:');
     console.log('- NODE_ENV:', process.env.NODE_ENV || 'development');
     console.log('- PORT:', PORT);
@@ -1546,28 +1584,28 @@ const startServer = async () => {
     
     const server = app.listen(PORT, () => {
       console.log('');
-      console.log('🎉 Full News CMS SaaS Server Started!');
+      console.log('🎉 Complete News CMS SaaS Server Started!');
       console.log('================================================');
       console.log(`🚀 Server: http://localhost:${PORT}`);
       console.log(`🏥 Health: http://localhost:${PORT}/health`);
-      console.log(`📖 Docs: http://localhost:${PORT}/api/docs`);
       console.log(`👑 Master: http://localhost:${PORT}/api/master/status`);
-      console.log(`🏢 Tenants: http://localhost:${PORT}/api/tenant-management`);
-      console.log(`🔧 Mode: full`);
-      console.log(`💾 Database: ${dbInitialized ? 'INITIALIZED' : 'NOT AVAILABLE'}`);
       console.log('');
-      console.log('🧪 Quick Test:');
+      console.log('🧪 Quick Tests:');
       console.log(`curl http://localhost:${PORT}/health`);
       console.log(`curl http://localhost:${PORT}/api/master/status`);
       console.log('');
-      console.log('✨ Server is ready with full tenant management!');
+      console.log('🏢 For tenant endpoints, use Host header:');
+      console.log(`curl -H "Host: yourdomain.com" http://localhost:${PORT}/api/auth/login`);
       console.log('');
-      console.log('💡 Available features:');
+      console.log('💾 Database:', dbInitialized ? 'INITIALIZED' : 'NOT AVAILABLE');
+      console.log('');
+      console.log('✨ Available features:');
       console.log('   ✅ Master admin management');
       console.log('   ✅ Complete tenant management');
-      console.log('   ✅ Automatic database provisioning');
       console.log('   ✅ Multi-tenant architecture');
-      console.log('   ✅ RESTful API endpoints');
+      console.log('   ✅ Tenant-specific authentication');
+      console.log('   ✅ Content management per tenant');
+      console.log('   ✅ Automatic database provisioning');
     });
     
     server.on('error', (error) => {
