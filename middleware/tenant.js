@@ -1,7 +1,6 @@
 // middleware/tenant.js
 const { getTenantDB, initializeTenantModels } = require('../config/database');
 const Tenant = require('../models/Tenant');
-const logger = require('../utils/logger');
 
 /**
  * Middleware to identify and load tenant based on domain
@@ -13,7 +12,8 @@ const identifyTenant = async (req, res, next) => {
     if (!host) {
       return res.status(400).json({
         success: false,
-        message: 'Host header is required'
+        message: 'Host header is required',
+        code: 'NO_HOST_HEADER'
       });
     }
 
@@ -36,8 +36,17 @@ const identifyTenant = async (req, res, next) => {
     if (!tenant) {
       return res.status(404).json({
         success: false,
-        message: 'Tenant not found',
-        code: 'TENANT_NOT_FOUND'
+        message: 'Tenant not found for domain: ' + domain,
+        code: 'TENANT_NOT_FOUND',
+        domain: domain,
+        help: {
+          message: 'This domain is not configured as a tenant',
+          steps: [
+            'Verify the domain is correct',
+            'Check if tenant exists in master admin panel',
+            'Ensure DNS is properly configured'
+          ]
+        }
       });
     }
 
@@ -46,7 +55,8 @@ const identifyTenant = async (req, res, next) => {
       return res.status(403).json({
         success: false,
         message: 'Tenant is not active',
-        code: 'TENANT_INACTIVE'
+        code: 'TENANT_INACTIVE',
+        tenant_status: tenant.status
       });
     }
 
@@ -55,7 +65,8 @@ const identifyTenant = async (req, res, next) => {
       return res.status(402).json({
         success: false,
         message: 'Trial period has expired',
-        code: 'TRIAL_EXPIRED'
+        code: 'TRIAL_EXPIRED',
+        trial_ends_at: tenant.trial_ends_at
       });
     }
 
@@ -64,17 +75,22 @@ const identifyTenant = async (req, res, next) => {
     req.tenantId = tenant.id;
 
     // Update last activity
-    tenant.last_activity = new Date();
-    await tenant.save();
+    try {
+      tenant.last_activity = new Date();
+      await tenant.save();
+    } catch (error) {
+      // Don't fail if we can't update last activity
+      console.warn('Failed to update tenant last activity:', error);
+    }
 
-    logger.info(`Tenant identified: ${tenant.name} (${tenant.domain})`);
+    console.log(`Tenant identified: ${tenant.name} (${tenant.domain})`);
     next();
 
   } catch (error) {
-    logger.error('Error identifying tenant:', error);
+    console.error('Error identifying tenant:', error);
     res.status(500).json({
       success: false,
-      message: 'Internal server error',
+      message: 'Internal server error while identifying tenant',
       code: 'TENANT_ERROR'
     });
   }
@@ -88,7 +104,8 @@ const loadTenantDB = async (req, res, next) => {
     if (!req.tenantId) {
       return res.status(400).json({
         success: false,
-        message: 'Tenant ID is required'
+        message: 'Tenant ID is required',
+        code: 'NO_TENANT_ID'
       });
     }
 
@@ -102,11 +119,22 @@ const loadTenantDB = async (req, res, next) => {
     req.db = tenantDB;
     req.models = models;
 
-    logger.debug(`Tenant DB loaded for: ${req.tenantId}`);
+    console.log(`Tenant DB loaded for: ${req.tenantId}`);
     next();
 
   } catch (error) {
-    logger.error('Error loading tenant database:', error);
+    console.error('Error loading tenant database:', error);
+    
+    // Provide specific error messages
+    if (error.code === 'ER_BAD_DB_ERROR') {
+      return res.status(500).json({
+        success: false,
+        message: 'Tenant database not found',
+        code: 'TENANT_DB_NOT_FOUND',
+        help: 'The tenant database may not be properly initialized'
+      });
+    }
+    
     res.status(500).json({
       success: false,
       message: 'Database connection error',
@@ -126,54 +154,78 @@ const checkTenantLimits = (resource) => {
       if (!tenant) {
         return res.status(400).json({
           success: false,
-          message: 'Tenant not found in request'
+          message: 'Tenant not found in request',
+          code: 'NO_TENANT_CONTEXT'
         });
       }
 
       let canProceed = true;
       let message = '';
+      let currentCount = 0;
+      let limit = 0;
 
       switch (resource) {
         case 'users':
-          const userCount = await req.models.User.getActiveCount();
-          canProceed = tenant.canCreateUser(userCount);
-          message = `User limit exceeded. Maximum allowed: ${tenant.limits.max_users}`;
+          currentCount = await req.models.User.getActiveCount();
+          limit = tenant.limits.max_users;
+          canProceed = tenant.canCreateUser(currentCount);
+          message = `User limit exceeded. Current: ${currentCount}, Maximum: ${limit}`;
           break;
 
         case 'articles':
-          const articleCount = await req.models.News.count();
-          canProceed = tenant.canCreateArticle(articleCount);
-          message = `Article limit exceeded. Maximum allowed: ${tenant.limits.max_articles}`;
+          currentCount = await req.models.News.count();
+          limit = tenant.limits.max_articles;
+          canProceed = tenant.canCreateArticle(currentCount);
+          message = `Article limit exceeded. Current: ${currentCount}, Maximum: ${limit}`;
           break;
 
         case 'categories':
-          const categoryCount = await req.models.Category.count();
-          canProceed = categoryCount < tenant.limits.max_categories;
-          message = `Category limit exceeded. Maximum allowed: ${tenant.limits.max_categories}`;
+          currentCount = await req.models.Category.count();
+          limit = tenant.limits.max_categories;
+          canProceed = currentCount < limit;
+          message = `Category limit exceeded. Current: ${currentCount}, Maximum: ${limit}`;
           break;
 
         case 'tags':
-          const tagCount = await req.models.Tag.count();
-          canProceed = tagCount < tenant.limits.max_tags;
-          message = `Tag limit exceeded. Maximum allowed: ${tenant.limits.max_tags}`;
+          currentCount = await req.models.Tag.count();
+          limit = tenant.limits.max_tags;
+          canProceed = currentCount < limit;
+          message = `Tag limit exceeded. Current: ${currentCount}, Maximum: ${limit}`;
           break;
+
+        default:
+          return res.status(400).json({
+            success: false,
+            message: 'Invalid resource type for limit check',
+            code: 'INVALID_RESOURCE'
+          });
       }
 
       if (!canProceed) {
         return res.status(402).json({
           success: false,
           message,
-          code: 'LIMIT_EXCEEDED'
+          code: 'LIMIT_EXCEEDED',
+          usage: {
+            current: currentCount,
+            limit: limit,
+            percentage: Math.round((currentCount / limit) * 100)
+          },
+          upgrade_info: {
+            current_plan: tenant.plan,
+            contact: 'Contact administrator to upgrade plan'
+          }
         });
       }
 
       next();
 
     } catch (error) {
-      logger.error('Error checking tenant limits:', error);
+      console.error('Error checking tenant limits:', error);
       res.status(500).json({
         success: false,
-        message: 'Error checking limits'
+        message: 'Error checking resource limits',
+        code: 'LIMIT_CHECK_ERROR'
       });
     }
   };
@@ -189,7 +241,8 @@ const requireFeature = (feature) => {
     if (!tenant) {
       return res.status(400).json({
         success: false,
-        message: 'Tenant not found in request'
+        message: 'Tenant not found in request',
+        code: 'NO_TENANT_CONTEXT'
       });
     }
 
@@ -197,7 +250,10 @@ const requireFeature = (feature) => {
       return res.status(403).json({
         success: false,
         message: `Feature '${feature}' is not available in your plan`,
-        code: 'FEATURE_NOT_AVAILABLE'
+        code: 'FEATURE_NOT_AVAILABLE',
+        current_plan: tenant.plan,
+        available_features: tenant.settings.features || {},
+        upgrade_info: 'Contact administrator to upgrade plan'
       });
     }
 
@@ -206,20 +262,182 @@ const requireFeature = (feature) => {
 };
 
 /**
- * Middleware for API endpoints that need tenant context
+ * Middleware to check tenant status
  */
-const tenantRequired = [identifyTenant, loadTenantDB];
+const requireActiveTenant = (req, res, next) => {
+  const tenant = req.tenant;
+  
+  if (!tenant) {
+    return res.status(400).json({
+      success: false,
+      message: 'Tenant context required',
+      code: 'NO_TENANT_CONTEXT'
+    });
+  }
+
+  if (tenant.status === 'suspended') {
+    return res.status(403).json({
+      success: false,
+      message: 'Tenant account is suspended',
+      code: 'TENANT_SUSPENDED',
+      contact: 'Contact administrator for assistance'
+    });
+  }
+
+  if (tenant.status === 'inactive') {
+    return res.status(403).json({
+      success: false,
+      message: 'Tenant account is inactive',
+      code: 'TENANT_INACTIVE'
+    });
+  }
+
+  next();
+};
 
 /**
- * Middleware for admin endpoints
+ * Middleware to add tenant info to response headers (for debugging)
  */
-const adminTenantRequired = [identifyTenant];
+const addTenantHeaders = (req, res, next) => {
+  if (req.tenant) {
+    res.set({
+      'X-Tenant-ID': req.tenant.id,
+      'X-Tenant-Name': req.tenant.name,
+      'X-Tenant-Plan': req.tenant.plan,
+      'X-Tenant-Status': req.tenant.status
+    });
+  }
+  
+  next();
+};
+
+/**
+ * Middleware to log tenant activity
+ */
+const logTenantActivity = (action) => {
+  return (req, res, next) => {
+    if (req.tenant && req.currentUser) {
+      console.log(`Tenant Activity: ${action}`, {
+        tenant_id: req.tenant.id,
+        tenant_name: req.tenant.name,
+        user_id: req.currentUser.id,
+        user_email: req.currentUser.email,
+        action: action,
+        timestamp: new Date().toISOString(),
+        ip: req.ip,
+        user_agent: req.get('User-Agent')
+      });
+    }
+    
+    next();
+  };
+};
+
+/**
+ * Middleware for API endpoints that need tenant context
+ */
+const tenantRequired = [identifyTenant, loadTenantDB, requireActiveTenant, addTenantHeaders];
+
+/**
+ * Middleware for admin endpoints (tenant context but no DB required)
+ */
+const adminTenantRequired = [identifyTenant, requireActiveTenant];
+
+/**
+ * Middleware for public endpoints (optional tenant context)
+ */
+const optionalTenant = async (req, res, next) => {
+  try {
+    const host = req.get('host');
+    
+    if (host) {
+      const domain = host.split(':')[0];
+      const parts = domain.split('.');
+      let tenant = null;
+
+      if (parts.length >= 3) {
+        const subdomain = parts[0];
+        tenant = await Tenant.findBySubdomain(subdomain);
+      } else {
+        tenant = await Tenant.findByDomain(domain);
+      }
+
+      if (tenant && tenant.isActive() && !tenant.isTrialExpired()) {
+        req.tenant = tenant;
+        req.tenantId = tenant.id;
+        
+        // Try to load tenant DB
+        try {
+          const tenantDB = await getTenantDB(req.tenantId);
+          const models = await initializeTenantModels(tenantDB);
+          req.db = tenantDB;
+          req.models = models;
+        } catch (error) {
+          // Continue without tenant DB if it fails
+          console.warn('Failed to load tenant DB in optional context:', error);
+        }
+      }
+    }
+    
+    next();
+  } catch (error) {
+    // Continue without tenant context if identification fails
+    console.warn('Failed to identify tenant in optional context:', error);
+    next();
+  }
+};
+
+/**
+ * Development helper - bypass tenant checks
+ */
+const bypassTenant = (req, res, next) => {
+  if (process.env.NODE_ENV === 'development' && process.env.BYPASS_TENANT === 'true') {
+    console.warn('⚠️  BYPASSING TENANT CHECKS - DEVELOPMENT ONLY');
+    
+    // Create fake tenant for development
+    req.tenant = {
+      id: 'dev-tenant-id',
+      name: 'Development Tenant',
+      domain: 'localhost',
+      plan: 'enterprise',
+      status: 'active',
+      limits: {
+        max_users: 1000,
+        max_articles: 10000,
+        max_categories: 1000,
+        max_tags: 1000
+      },
+      settings: {
+        features: {
+          analytics: true,
+          seo: true,
+          advanced_editor: true,
+          api_access: true
+        }
+      },
+      hasFeature: () => true,
+      isActive: () => true,
+      isTrialExpired: () => false,
+      canCreateUser: () => true,
+      canCreateArticle: () => true
+    };
+    
+    req.tenantId = 'dev-tenant-id';
+  }
+  
+  next();
+};
 
 module.exports = {
   identifyTenant,
   loadTenantDB,
   checkTenantLimits,
   requireFeature,
+  requireActiveTenant,
+  addTenantHeaders,
+  logTenantActivity,
   tenantRequired,
-  adminTenantRequired
+  adminTenantRequired,
+  optionalTenant,
+  bypassTenant
 };

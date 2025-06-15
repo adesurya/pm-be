@@ -4,7 +4,6 @@ const rateLimit = require('express-rate-limit');
 const xss = require('xss');
 const sanitizeHtml = require('sanitize-html');
 const path = require('path');
-const logger = require('../utils/logger');
 
 /**
  * Content Security Policy configuration
@@ -69,7 +68,7 @@ const createRateLimit = (windowMs, max, message, skipSuccessfulRequests = false)
     legacyHeaders: false,
     skipSuccessfulRequests,
     handler: (req, res) => {
-      logger.warn(`Rate limit exceeded for IP: ${req.ip}, Path: ${req.path}`);
+      console.warn(`Rate limit exceeded for IP: ${req.ip}, Path: ${req.path}`);
       res.status(429).json({
         success: false,
         message,
@@ -272,7 +271,7 @@ const ipWhitelist = (allowedIPs) => {
     
     if (allowedIPs && allowedIPs.length > 0) {
       if (!allowedIPs.includes(clientIP)) {
-        logger.warn(`Unauthorized IP access attempt: ${clientIP}`);
+        console.warn(`Unauthorized IP access attempt: ${clientIP}`);
         return res.status(403).json({
           success: false,
           message: 'Access denied',
@@ -289,12 +288,12 @@ const ipWhitelist = (allowedIPs) => {
  * Security headers middleware
  */
 const securityHeaders = helmet({
-  contentSecurityPolicy: cspConfig,
-  hsts: {
+  contentSecurityPolicy: process.env.NODE_ENV === 'production' ? cspConfig : false,
+  hsts: process.env.NODE_ENV === 'production' ? {
     maxAge: 31536000,
     includeSubDomains: true,
     preload: true
-  },
+  } : false,
   frameguard: {
     action: 'deny'
   },
@@ -333,7 +332,7 @@ const securityLogger = (req, res, next) => {
   
   for (const pattern of suspiciousPatterns) {
     if (pattern.test(requestData)) {
-      logger.warn(`Suspicious request detected from IP: ${req.ip}`, {
+      console.warn(`Suspicious request detected from IP: ${req.ip}`, {
         url: req.url,
         method: req.method,
         userAgent: req.get('User-Agent'),

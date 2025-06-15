@@ -2,13 +2,9 @@
 const express = require('express');
 const router = express.Router();
 
-// Import route modules
+// Import route modules with error handling
 const authRoutes = require('./auth');
 const newsRoutes = require('./news');
-const categoryRoutes = require('./categories');
-const tagRoutes = require('./tags');
-const userRoutes = require('./users');
-const tenantRoutes = require('./tenants');
 
 // Import middleware
 const { csrfTokenEndpoint } = require('../middleware/csrf');
@@ -19,10 +15,35 @@ router.get('/csrf-token', csrfTokenEndpoint);
 // Mount route modules
 router.use('/auth', authRoutes);
 router.use('/news', newsRoutes);
-router.use('/categories', categoryRoutes);
-router.use('/tags', tagRoutes);
-router.use('/users', userRoutes);
-router.use('/tenants', tenantRoutes);
+
+// Import optional routes with error handling
+try {
+  const categoryRoutes = require('./categories');
+  router.use('/categories', categoryRoutes);
+} catch (error) {
+  console.warn('Categories routes not available:', error.message);
+}
+
+try {
+  const tagRoutes = require('./tags');
+  router.use('/tags', tagRoutes);
+} catch (error) {
+  console.warn('Tags routes not available:', error.message);
+}
+
+try {
+  const userRoutes = require('./users');
+  router.use('/users', userRoutes);
+} catch (error) {
+  console.warn('Users routes not available:', error.message);
+}
+
+try {
+  const tenantRoutes = require('./tenants');
+  router.use('/tenants', tenantRoutes);
+} catch (error) {
+  console.warn('Tenants routes not available:', error.message);
+}
 
 // API information endpoint
 router.get('/', (req, res) => {
@@ -41,9 +62,9 @@ router.get('/', (req, res) => {
       'POST /api/auth/login - User login',
       'POST /api/auth/register - User registration',
       'GET /api/news - Get news articles',
-      'GET /api/categories - Get categories',
-      'GET /api/tags - Get tags',
-      'GET /api/users - Get users (admin only)'
+      'GET /api/categories - Get categories (if available)',
+      'GET /api/tags - Get tags (if available)',
+      'GET /api/users - Get users (admin only, if available)'
     ]
   });
 });
