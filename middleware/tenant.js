@@ -402,10 +402,10 @@ const bypassTenant = (req, res, next) => {
       plan: 'enterprise',
       status: 'active',
       limits: {
-        max_users: 1000,
-        max_articles: 10000,
-        max_categories: 1000,
-        max_tags: 1000
+        max_users: 9999999,
+        max_articles: 9999999,
+        max_categories: 9999999,
+        max_tags: 9999999
       },
       settings: {
         features: {

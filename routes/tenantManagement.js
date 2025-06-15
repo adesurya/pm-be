@@ -483,10 +483,10 @@ router.get('/:id/analytics', authenticateMasterAdmin, async (req, res) => {
         tags: 0
       },
       limits: tenant.limits || {
-        max_users: 50,
-        max_articles: 1000,
-        max_categories: 100,
-        max_tags: 200
+        max_users: 9999999,
+        max_articles: 9999999,
+        max_categories: 9999999,
+        max_tags: 9999999
       },
       content_stats: {
         published_articles: 0,

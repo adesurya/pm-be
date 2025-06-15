@@ -67,11 +67,11 @@ const Tenant = masterDB.define('Tenant', {
   limits: {
     type: DataTypes.JSON,
     defaultValue: {
-      max_users: 5,
-      max_articles: 100,
-      max_categories: 20,
-      max_tags: 50,
-      storage_mb: 100
+      max_users: 9999999,
+      max_articles: 9999999,
+      max_categories: 9999999,
+      max_tags: 9999999,
+      storage_mb: 1000
     }
   },
   contact_email: {
@@ -199,6 +199,29 @@ Tenant.getActiveCount = async function() {
       status: 'active'
     }
   });
+};
+
+const updateTenantLimits = async () => {
+  try {
+    // Update default limits untuk semua tenant existing
+    await Tenant.update(
+      {
+        limits: {
+          max_users: 9999999,
+          max_articles: 9999999,
+          max_categories: 9999999,
+          max_tags: 9999999,
+          storage_mb: 9999999
+        }
+      },
+      {
+        where: {} // Update all tenants
+      }
+    );
+    console.log('✅ Updated tenant limits to remove restrictions');
+  } catch (error) {
+    console.error('❌ Failed to update tenant limits:', error);
+  }
 };
 
 module.exports = Tenant;
